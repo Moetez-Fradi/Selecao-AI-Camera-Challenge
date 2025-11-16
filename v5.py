@@ -45,11 +45,11 @@ ARM_ACTIVITY_THRESHOLD    = 0.005
 MIN_SHOULDER_WIDTH_FRAC   = 0.10     # smaller people are OK
 STATIONARY_SECONDS        = 4.0      # Adjusted as per user
 
-CLIENT_BOX_SCALE_W = 2.5  # Width scale
+CLIENT_BOX_SCALE_W = 3  # Width scale
 CLIENT_BOX_SCALE_H = 1  # Height scale
 SCORE_INTERVAL   = 1.0  # Compute scores every 1 second
 CENTROID_DISP_THRESH = 0.05  # Relaxed to 0.05 (5% of frame) for "close to same place"
-LEAVING_THRESHOLD = 0.5  # Overlap below this considers client left
+LEAVING_THRESHOLD = 0.2  # Overlap below this considers client left
 ENTERING_THRESHOLD = 0.90  # Overlap at or above this to count as new client
 
 COCO_CONNECTIONS = [
@@ -440,7 +440,8 @@ while True:
                 print(f"[{time.strftime('%H:%M:%S')}] Ignored candidate ID {best_tid}: no face detected.")
 
         # Check if enough data to find guichet
-        if len(transaction_locations) > 10:  # Min points to cluster
+        if len(transaction_locations) > 10: 
+            guichet_start_time = stationary_start_time[best_tid]
             from sklearn.cluster import DBSCAN
             locs = np.array(transaction_locations)
             cl = DBSCAN(eps=50, min_samples=3).fit(locs)
@@ -486,7 +487,7 @@ while True:
         if front_tid is not None:
             if current_client_tid is None or current_client_tid != front_tid:
                 if current_client_tid is not None:
-                    total_time = now - client_start_time
+                    total_time = now - guichet_start_time
                     if client_scores:
                         posture_scores = [s[0] for s in client_scores]
                         face_scores    = [s[1] for s in client_scores]
@@ -635,6 +636,15 @@ while True:
     cv2.putText(annotated, f"face : {current_face_sc}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(annotated, f"posture : {current_body_sc}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(annotated, f"total : {current_agg_sc}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    # Display chronometer in top right corner if a client is present
+    if current_client_tid is not None:
+        elapsed = now - client_start_time + guichet_start_time
+        chron_text = f"Client Time: {elapsed:.1f}s"
+        text_size = cv2.getTextSize(chron_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        chron_x = fw - text_size[0] - 10
+        chron_y = 30
+        cv2.putText(annotated, chron_text, (chron_x, chron_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
     # Draw graph if in monitoring mode and have data
     if monitoring_mode and len(agg_history) > 0:
