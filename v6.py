@@ -1,62 +1,79 @@
-import os
 import time
-import math
-import json
 import collections
-import urllib.request
-from tqdm import tqdm
+import math
 import numpy as np
 import cv2
 from ultralytics import YOLO
-import mediapipe as mp
-from sklearn.cluster import DBSCAN
+import os
+import urllib.request
+from tqdm import tqdm
+import torch
+import timm
+from openai import OpenAI
+import dotenv
+
+dotenv.load_dotenv()
+
+model = YOLO("yolov8x-pose.pt")
+cap   = cv2.VideoCapture("./testcases/siu.mp4")
 
 TINY_FACE_URL  = "https://github.com/lindevs/yolov8-face/releases/download/v1.0.0/yolov8n-face-lindevs.pt"
 TINY_FACE_PATH = "yolov8n-face-lindevs.pt"
 
 if not os.path.exists(TINY_FACE_PATH):
+    print("Downloading tiny face model …")
     def _download(url, dst):
         with tqdm(unit='B', unit_scale=True, desc=os.path.basename(dst)) as t:
             def _reporthook(b, bs, ts):
-                if ts != -1:
-                    t.total = ts
+                if ts != -1: t.total = ts
                 t.update(bs)
             urllib.request.urlretrieve(url, dst, reporthook=_reporthook)
     _download(TINY_FACE_URL, TINY_FACE_PATH)
+    print("Done!")
 
-model = YOLO("yolov8x-pose.pt")
 face_model = YOLO(TINY_FACE_PATH)
 
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(static_image_mode=False, max_num_faces=2, refine_landmarks=True,
-                             min_detection_confidence=0.3, min_tracking_confidence=0.3)
-mp_drawing = mp.solutions.drawing_utils
+EMOTION_MODEL_URL = "https://github.com/sb-ai-lab/EmotiEffLib/raw/main/models/affectnet_emotions/enet_b0_8_best_afew.pt"
+EMOTION_MODEL_PATH = "enet_b0_8_best_afew.pt"
 
-HISTORY_LEN = 20
-SCORE_INTERVAL = 1.0
-CENTROID_DISP_THRESH = 0.05
-STATIONARY_SECONDS = 4.0
-TORSO_ACTIVITY_THRESHOLD = 0.0025
-ARM_ACTIVITY_THRESHOLD = 0.005
-MIN_SHOULDER_WIDTH_FRAC = 0.10
+if not os.path.exists(EMOTION_MODEL_PATH):
+    print("Downloading emotion model …")
+    def _download(url, dst):
+        with tqdm(unit='B', unit_scale=True, desc=os.path.basename(dst)) as t:
+            def _reporthook(b, bs, ts):
+                if ts != -1: t.total = ts
+                t.update(bs)
+            urllib.request.urlretrieve(url, dst, reporthook=_reporthook)
+    _download(EMOTION_MODEL_URL, EMOTION_MODEL_PATH)
+    print("Done!")
 
-def box_overlap(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
+# Create the model with the correct classifier structure
+emotion_model = timm.create_model('efficientnet_b0', num_classes=8, pretrained=False)
 
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
+# Load the entire model from the file (instead of just state dict)
+# This preserves the exact architecture used during training
+emotion_model = torch.load(EMOTION_MODEL_PATH, map_location='cpu', weights_only=False)
+emotion_model.eval()
 
-    iw = max(0, ix2 - ix1)
-    ih = max(0, iy2 - iy1)
-    inter = iw * ih
+HISTORY_LEN               = 20  # Increased for more robustness
+TORSO_ACTIVITY_THRESHOLD  = 0.0025   # the movement allowed
+ARM_ACTIVITY_THRESHOLD    = 0.005
+MIN_SHOULDER_WIDTH_FRAC   = 0.10     # smaller people are OK
+STATIONARY_SECONDS        = 4.0      # Adjusted as per user
 
-    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
-    return inter / area_a
+CLIENT_BOX_SCALE_W = 3  # Width scale
+CLIENT_BOX_SCALE_H = 1  # Height scale
+SCORE_INTERVAL   = 1.0  # Compute scores every 1 second
+CENTROID_DISP_THRESH = 0.05  # Relaxed to 0.05 (5% of frame) for "close to same place"
+LEAVING_THRESHOLD = 0.2  # Overlap below this considers client left
+ENTERING_THRESHOLD = 0.90  # Overlap at or above this to count as new client
 
+COCO_CONNECTIONS = [
+    (0, 1), (0, 2), (1, 3), (2, 4), (0, 5), (0, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+    (5, 6), (5, 11), (6, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 12)
+]
 
+# HELPERS
 def _angle_between_deg(v1, v2):
     n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
     if n1 == 0 or n2 == 0: return 0.0
@@ -64,13 +81,11 @@ def _angle_between_deg(v1, v2):
     return math.degrees(math.acos(c))
 
 def _clamp01(x): return max(0.0, min(1.0, x))
-
 def _map_to_01(v, a, b):
     if b == a: return 0.0
     return _clamp01((v - a) / (b - a))
 
-# posture/face/transaction functions (adapted from your code)
-
+# SATISFACTION (posture) - Updated for YOLO keypoints, added crossed arms penalty, adjusted weights for better realism
 def compute_satisfaction_score(history, fw, fh, prev_score=None, alpha=0.6):
     if len(history) < 3: return None, 0, {}
     pts_now  = history[-1]
@@ -82,7 +97,7 @@ def compute_satisfaction_score(history, fw, fh, prev_score=None, alpha=0.6):
     disp2 = np.linalg.norm(pts_prev - pts_old, axis=1)
     activity = float((disp1.mean() + disp2.mean()) / 2.0)
 
-    L_SH, R_SH = 5, 6
+    L_SH, R_SH = 5, 6  # YOLO shoulders
     L_HIP, R_HIP = 11, 12
     NOSE = 0
     L_ELB, R_ELB = 7, 8
@@ -110,73 +125,99 @@ def compute_satisfaction_score(history, fw, fh, prev_score=None, alpha=0.6):
     wrist_dist     = np.linalg.norm(pts_now[L_WRIST] - pts_now[R_WRIST])
     arm_openness   = _clamp01((wrist_dist / shoulder_width) / 2.5)
 
-    wrist_to_nose = min(np.linalg.norm(pts_now[L_WRIST] - nose), np.linalg.norm(pts_now[R_WRIST] - nose))
+    wrist_to_nose = min(np.linalg.norm(pts_now[L_WRIST] - nose),
+                        np.linalg.norm(pts_now[R_WRIST] - nose))
     hands_face = _map_to_01(wrist_to_nose, 0.01, 0.20)
 
+    # Detect crossed arms for penalty (robust check with vector cross product for better accuracy)
     crossed_arms_penalty = 0.0
-    try:
-        if all(np.any(pts_now[i]) for i in [L_ELB, R_ELB, L_WRIST, R_WRIST, L_SH, R_SH, L_HIP, R_HIP]):
-            if (pts_now[L_WRIST][0] > pts_now[R_SH][0] and pts_now[R_WRIST][0] < pts_now[L_SH][0]) or \
-               (pts_now[L_WRIST][0] > pts_now[R_ELB][0] and pts_now[R_WRIST][0] < pts_now[L_ELB][0]):
-                chest_y_min = min(pts_now[L_SH][1], pts_now[R_SH][1])
-                chest_y_max = max(pts_now[L_HIP][1], pts_now[R_HIP][1])
-                if chest_y_min < pts_now[L_WRIST][1] < chest_y_max and chest_y_min < pts_now[R_WRIST][1] < chest_y_max:
-                    crossed_arms_penalty = 0.25
-    except Exception:
-        crossed_arms_penalty = 0.0
+    if all(pts_now[i].any() for i in [L_ELB, R_ELB, L_WRIST, R_WRIST, L_SH, R_SH, L_HIP, R_HIP]):
+        # Wrists crossed over body
+        if (pts_now[L_WRIST][0] > pts_now[R_SH][0] and pts_now[R_WRIST][0] < pts_now[L_SH][0]) or \
+           (pts_now[L_WRIST][0] > pts_now[R_ELB][0] and pts_now[R_WRIST][0] < pts_now[L_ELB][0]):
+            # Check if wrists are at chest level (between shoulders and hips y)
+            chest_y_min = min(pts_now[L_SH][1], pts_now[R_SH][1])
+            chest_y_max = max(pts_now[L_HIP][1], pts_now[R_HIP][1])
+            if chest_y_min < pts_now[L_WRIST][1] < chest_y_max and chest_y_min < pts_now[R_WRIST][1] < chest_y_max:
+                # Additional vector check for crossing
+                left_arm_vec = pts_now[L_WRIST] - pts_now[L_ELB]
+                right_arm_vec = pts_now[R_WRIST] - pts_now[R_ELB]
+                cross_prod = left_arm_vec[0] * right_arm_vec[1] - left_arm_vec[1] * right_arm_vec[0]
+                if abs(cross_prod) > 0.01:  # Threshold for crossing
+                    crossed_arms_penalty = 0.50  # Increased penalty for realism
 
     activity_score = _map_to_01(activity, 0.0008, 0.018)
     upright_score = 1.0 if torso_angle <= 10 else 0.0 if torso_angle >= 40 else 1.0 - ((torso_angle-10)/(40-10))
     head_align_score = _clamp01(1.0 - (head_torso_angle/40.0))
     shoulder_sym_score = 1.0 - _clamp01(shoulder_sym*3.0)
     hands_open_score   = hands_face
-    arm_open_score = arm_openness
+    arm_open_score = arm_openness  # Weight more if needed
 
-    combined = (0.30*upright_score + 0.25*activity_score + 0.15*hands_open_score +
-                0.15*arm_open_score + 0.10*head_align_score + 0.05*shoulder_sym_score)
-    combined -= crossed_arms_penalty
+    combined = (0.40*upright_score + 0.20*head_align_score + 0.10*activity_score + 
+                0.10*hands_open_score + 0.10*arm_open_score + 0.10*shoulder_sym_score)
+    combined -= crossed_arms_penalty  # Apply penalty for crossed arms
+
+    # Additional tweaks for realism
+    harsh_penalty = 0.0
+    if activity > 0.018:
+        harsh_penalty = 0.30
+    combined -= harsh_penalty
+
+    close_arms_penalty = 0.0
+    if arm_openness < 0.3:
+        close_arms_penalty = 0.20
+    combined -= close_arms_penalty
+
+    relaxed_boost = 0.0
+    if arm_openness > 0.7 and upright_score > 0.8 and activity < 0.005:
+        relaxed_boost = 0.20
+    combined += relaxed_boost
+
     combined = _clamp01(combined)
 
     if prev_score is not None:
         combined = alpha*combined + (1-alpha)*(prev_score/100.0)
 
     score = int(combined*100)
-    label = "satisfied" if score >= 70 else "neutral" if score >= 45 else "dissatisfied"
+
+    # Determine label with overrides for specific conclusions
+    if harsh_penalty > 0:
+        label = "angry"
+    elif crossed_arms_penalty > 0:
+        label = "bored"
+    elif close_arms_penalty > 0:
+        label = "uncomfortable"
+    elif relaxed_boost > 0:
+        label = "comfortable"
+    else:
+        label = "satisfied" if score >= 70 else "neutral" if score >= 45 else "dissatisfied"
 
     return label, score, {}
 
-
-def compute_face_expression_score(face_landmarks, fw, fh, prev_score=None, alpha=0.6):
-    if face_landmarks is None: return None, 0, {}
-    pts = np.array([[p.x, p.y] for p in face_landmarks.landmark], dtype=np.float32)
-    try:
-        lm_l_mouth = pts[61]; lm_r_mouth = pts[291]
-        lm_top_lip = pts[13]; lm_bottom_lip = pts[14]
-        lm_l_eye   = pts[33]; lm_r_eye   = pts[263]
-    except Exception:
-        return None, 0, {}
-
-    mouth_w = np.linalg.norm(lm_r_mouth - lm_l_mouth)
-    mouth_h = np.linalg.norm(lm_bottom_lip - lm_top_lip)
-    eye_dist = np.linalg.norm(lm_r_eye - lm_l_eye) + 1e-6
-
-    smile_ratio = mouth_w / eye_dist
-    mouth_open_ratio = mouth_h / eye_dist
-
-    smile_score = _map_to_01(smile_ratio, 0.35, 0.75)
-    open_score  = _map_to_01(mouth_open_ratio, 0.02, 0.18)
-
-    combined = 0.8*smile_score + 0.2*open_score
-    combined = _clamp01(combined)
-
+# FACE EXPRESSION
+def compute_face_expression_score(face_crop, prev_score=None, alpha=0.6):
+    if face_crop is None or face_crop.size == 0: return None, 0, {}
+    resized = cv2.resize(face_crop, (224, 224))  # RGB, no grayscale conversion
+    normalized = resized / 255.0
+    tensor = torch.tensor(normalized, dtype=torch.float32).permute(2, 0, 1).unsqueeze(0)  # [1, 3, 224, 224]
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    tensor = (tensor - mean) / std
+    with torch.no_grad():
+        output = emotion_model(tensor)
+        probs = torch.softmax(output, dim=1)
+    # Assuming classes: 0:anger, 1:contempt, 2:disgust, 3:fear, 4:happy, 5:neutral, 6:sad, 7:surprise
+    happy_prob = probs[0,4].item()
+    neutral_prob = probs[0,5].item()
+    surprise_prob = probs[0,7].item()
+    score = happy_prob * 100 + neutral_prob * 50 + surprise_prob * 30
+    score = min(score, 100.0)
     if prev_score is not None:
-        combined = alpha*combined + (1-alpha)*(prev_score/100.0)
-
-    score = int(combined*100)
+        score = alpha * score + (1 - alpha) * prev_score
     label = "satisfied" if score >= 70 else "neutral" if score >= 45 else "dissatisfied"
-    return label, score, {}
+    return label, int(score), {}
 
-
+# TRANSACTION INDICATORS (torso still, arms moving) - Updated for YOLO
 def compute_transaction_indicators(history, fw, fh):
     if len(history) < 3: return None, {}
     pts_now  = history[-1]; pts_prev = history[-2]; pts_old = history[-3]
@@ -185,8 +226,8 @@ def compute_transaction_indicators(history, fw, fh):
     disp1 = np.linalg.norm(pts_now - pts_prev, axis=1)
     disp2 = np.linalg.norm(pts_prev - pts_old, axis=1)
 
-    torso_pts = [5,6,11,12]
-    arm_pts   = [7,8,9,10]
+    torso_pts = [5,6,11,12]  # YOLO shoulders + hips
+    arm_pts   = [7,8,9,10]   # elbows + wrists
 
     torso_disp = (disp1[torso_pts].mean() + disp2[torso_pts].mean())/2.0
     arm_disp   = (disp1[arm_pts].mean()   + disp2[arm_pts].mean())/2.0
@@ -211,256 +252,553 @@ def compute_transaction_indicators(history, fw, fh):
 
     return "potential_transaction" if is_transaction else None, diag
 
-# face helper
-last_face_check = 0.0
-cached_face_box = None
-cached_face_landmarks = None
+# DATA STRUCTURES
+landmark_histories      = {}
+torso_activity_histories = {}
+bbox_histories          = {}  # NEW: for client box estimation
+stationary_since        = {}
+prev_body_scores        = {}
+prev_face_scores        = {}
+stationary_start_time = {}  # NEW: tid -> time when it first became stationary
 
-def get_face_for_person(frame, person_bbox, now):
-    global last_face_check, cached_face_box, cached_face_landmarks
+last_print = 0.0
+
+transaction_locations = []
+
+# NEW: Client tracking
+current_client_tid = None
+client_start_time  = None
+client_scores      = []  # list of (posture_score, face_score, agg_score) per second
+last_score_time    = 0.0
+client_logs        = []  # Final per-client stats
+
+# NEW: Guichet / Client Box
+client_box    = None  # (x1,y1,x2,y2)
+
+# NEW: Overlap calculation
+def box_overlap(box1, box2):
+    # box = (x1,y1,x2,y2)
+    ix1 = max(box1[0], box2[0])
+    iy1 = max(box1[1], box2[1])
+    ix2 = min(box1[2], box2[2])
+    iy2 = min(box1[3], box2[3])
+    ia  = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    a1  = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    return ia / a1 if a1 > 0 else 0.0
+
+# NEW: Compute bbox area as proxy for closeness
+def bbox_area(box):
+    x1,y1,x2,y2 = box
+    return (x2 - x1) * (y2 - y1)
+
+# NEW: Compute centroid displacement
+def compute_centroid_disp(bbox_list, fw, fh):
+    if len(bbox_list) < 3: return 1.0
+    disps = []
+    for i in range(1, len(bbox_list)):
+        x1,y1,x2,y2 = bbox_list[i]
+        px1,py1,px2,py2 = bbox_list[i-1]
+        c_i = ((x1 + x2)/2 / fw, (y1 + y2)/2 / fh)
+        c_prev = ((px1 + px2)/2 / fw, (py1 + py2)/2 / fh)
+        disps.append(np.linalg.norm(np.array(c_i) - np.array(c_prev)))
+    return np.mean(disps)
+
+# -----------------------------------------------------------------
+# 0.5-second face detector – runs only when we need a new face
+# -----------------------------------------------------------------
+last_face_check = 0.0
+cached_face_box = None          # (x1,y1,x2,y2)  – kept until next check
+cached_face_crop = None   # face crop for emotion model
+
+def get_face_for_person(person_bbox, now):
+    """Return (face_box, face_crop) for the given person bbox.
+       Detects only every 0.5 s, otherwise re-uses the cached result."""
+    global last_face_check, cached_face_box, cached_face_crop
+
+    # ---- 0.5 s throttle -------------------------------------------------
     if now - last_face_check < 0.5:
+        # reuse previous detection (still valid for the same person)
         if cached_face_box and box_overlap(person_bbox, cached_face_box) > 0.4:
-            return cached_face_box, cached_face_landmarks
-    x1,y1,x2,y2 = person_bbox
+            return cached_face_box, cached_face_crop
+        # otherwise fall-through to a fresh detection
+
+    # ---- fresh YOLO-face detection --------------------------------------
+    x1, y1, x2, y2 = person_bbox
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         return None, None
-    results = face_model(crop, verbose=False, conf=0.25)
+
+    results = face_model(crop, verbose=False, conf=0.25)   # tiny model, fast
     if results[0].boxes is None or len(results[0].boxes) == 0:
+        # no face → clear cache
         cached_face_box = None
-        cached_face_landmarks = None
+        cached_face_crop = None
         return None, None
+
+    # take the highest-conf face
     best = results[0].boxes[0]
     fx1, fy1, fx2, fy2 = map(int, best.xyxy[0].tolist())
+    # convert back to full-image coordinates
     fx1 += x1; fy1 += y1; fx2 += x1; fy2 += y1
     face_box = (fx1, fy1, fx2, fy2)
+
+    # ---- get face crop -----
     crop_face_y1 = max(0, fy1 - y1)
     crop_face_y2 = min(crop.shape[0], fy2 - y1)
     crop_face_x1 = max(0, fx1 - x1)
     crop_face_x2 = min(crop.shape[1], fx2 - x1)
     face_crop = crop[crop_face_y1:crop_face_y2, crop_face_x1:crop_face_x2]
-    landmarks = None
-    if face_crop.size != 0:
-        rgb_crop = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-        mp_res = face_mesh.process(rgb_crop)
-        if mp_res.multi_face_landmarks:
-            lm = mp_res.multi_face_landmarks[0]
-            fw_face = crop_face_x2 - crop_face_x1
-            fh_face = crop_face_y2 - crop_face_y1
-            for p in lm.landmark:
-                p.x = (p.x * fw_face + (fx1)) / frame.shape[1]
-                p.y = (p.y * fh_face + (fy1)) / frame.shape[0]
-            landmarks = lm
-    cached_face_box = face_box
-    cached_face_landmarks = landmarks
-    last_face_check = now
-    return face_box, landmarks
+    if face_crop.size == 0:
+        face_crop = None
 
-# IoU tracker fallback
+    # cache for the next 0.5 s
+    cached_face_box       = face_box
+    cached_face_crop = face_crop
+    last_face_check       = now
+    return face_box, face_crop
 
-def iou(a,b):
-    ax1,ay1,ax2,ay2 = a
-    bx1,by1,bx2,by2 = b
-    ix1 = max(ax1,bx1); iy1 = max(ay1,by1)
-    ix2 = min(ax2,bx2); iy2 = min(ay2,by2)
-    iw = max(0, ix2-ix1); ih = max(0, iy2-iy1)
-    inter = iw*ih
-    aarea = max(1,(ax2-ax1)*(ay2-ay1))
-    barea = max(1,(bx2-bx1)*(by2-by1))
-    return inter / float(aarea + barea - inter)
+# Function to draw satisfaction graph on the frame
+def draw_satisfaction_graph(frame, agg_history, fw, graph_height=200):
+    if len(agg_history) == 0:
+        return frame
+    # Add border at bottom for graph
+    graph_frame = np.zeros((graph_height, frame.shape[1], 3), dtype=np.uint8) + 255  # White background, use frame.shape[1] for width
+    if len(agg_history) < 2:
+        cv2.putText(graph_frame, "No data yet", (10, graph_height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    else:
+        # Draw axes
+        cv2.line(graph_frame, (50, graph_height - 50), (frame.shape[1] - 50, graph_height - 50), (0, 0, 0), 2)  # X axis
+        cv2.line(graph_frame, (50, graph_height - 50), (50, 50), (0, 0, 0), 2)  # Y axis
+        cv2.putText(graph_frame, "0", (30, graph_height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        cv2.putText(graph_frame, "100", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        cv2.putText(graph_frame, "Satisfaction over time", (frame.shape[1] // 2 - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-class SimpleIOUTracker:
-    def __init__(self, iou_thresh=0.3, max_age=30):
-        self.tracks = {}
-        self.next_id = 1
-        self.iou_thresh = iou_thresh
-        self.max_age = max_age
-    def update(self, detections, frame_id):
-        assigned = set()
-        dets = [tuple(map(int,d[:4])) for d in detections]
-        new_tracks = {}
-        for tid, t in list(self.tracks.items()):
-            best_iou = 0; best_j = -1
-            for j,det in enumerate(dets):
-                if j in assigned: continue
-                val = iou(t['bbox'], det)
-                if val > best_iou:
-                    best_iou, best_j = val, j
-            if best_iou >= self.iou_thresh:
-                new_tracks[tid] = {'bbox':dets[best_j], 'last_seen':frame_id}
-                assigned.add(best_j)
-            else:
-                if frame_id - t['last_seen'] <= self.max_age:
-                    new_tracks[tid] = t
-        for j,det in enumerate(dets):
-            if j in assigned: continue
-            new_tracks[self.next_id] = {'bbox':det, 'last_seen':frame_id}
-            self.next_id += 1
-        self.tracks = new_tracks
-        out = []
-        for tid,t in self.tracks.items():
-            x1,y1,x2,y2 = t['bbox']
-            out.append(type('T', (), {'track_id': tid, 'tlbr': (x1,y1,x2,y2)}))
-        return out
+        # Plot points
+        max_x = frame.shape[1] - 100
+        max_y = graph_height - 100
+        points = []
+        for i, score in enumerate(agg_history):
+            x = 50 + int(i * max_x / max(1, (len(agg_history) - 1)))
+            y = (graph_height - 50) - int(score / 100 * max_y)
+            points.append((x, y))
+            cv2.circle(graph_frame, (x, y), 3, (0, 0, 255), -1)
 
-# cluster pixelrefer output to zones
+        # Draw lines
+        for i in range(1, len(points)):
+            cv2.line(graph_frame, points[i-1], points[i], (0, 0, 255), 2)
 
-def cluster_pixelrefer(pr_json, eps=50, min_samples=10, margin=80):
-    with open(pr_json,'r') as f:
-        data = json.load(f)
-    centroids = []
-    for entry in data:
-        for b in entry.get('boxes',[]):
-            x1,y1,x2,y2,score = b
-            centroids.append([(x1+x2)/2.0,(y1+y2)/2.0])
-    if len(centroids) == 0:
-        return []
-    centroids = np.array(centroids)
-    cl = DBSCAN(eps=eps, min_samples=min_samples).fit(centroids)
-    labels = cl.labels_
-    zones = []
-    for lbl in np.unique(labels):
-        if lbl < 0: continue
-        pts = centroids[labels==lbl]
-        cx,cy = pts.mean(axis=0)
-        x_min,y_min = pts.min(axis=0) - margin
-        x_max,y_max = pts.max(axis=0) + margin
-        zones.append({'label':int(lbl),'bbox':[int(x_min),int(y_min),int(x_max),int(y_max)],'centroid':[int(cx),int(cy)]})
-    with open('service_zones.json','w') as f:
-        json.dump(zones,f,indent=2)
-    return zones
+    # Concat to original frame
+    frame_with_graph = np.vstack((frame, graph_frame))
+    return frame_with_graph
 
-# main run function
+# Manual client zone selection
+drawing = False
+ix, iy = -1, -1
+rect_drawn = False
 
-def run(video_path, pixelrefer_json=None, zone_index=0, out_csv='client_logs.csv'):
-    zones = []
-    if pixelrefer_json and os.path.exists(pixelrefer_json):
-        zones = cluster_pixelrefer(pixelrefer_json)
-    if not zones:
-        print('No PixelRefer zones found; please run PixelRefer or provide pixelrefer_json')
-        return
-    zone = zones[zone_index]['bbox']
+def draw_rectangle(event, x, y, flags, param):
+    global ix, iy, drawing, frame_copy, rect_drawn, client_box
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        ix, iy = x, y
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if drawing:
+            img = frame_copy.copy()
+            cv2.rectangle(img, (ix, iy), (x, y), (0, 255, 0), 2)
+            cv2.imshow('Select Client Zone', img)
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        cv2.rectangle(frame_copy, (ix, iy), (x, y), (0, 255, 0), 2)
+        cv2.imshow('Select Client Zone', frame_copy)
+        client_box = (min(ix, x), min(iy, y), max(ix, x), max(iy, y))
+        rect_drawn = True
 
-    cap = cv2.VideoCapture(video_path)
-    fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
-    tracker = SimpleIOUTracker(iou_thresh=0.3, max_age=int(fps*2))
-
-    landmark_histories = {}
-    prev_body_scores = {}
-    prev_face_scores = {}
-    active_clients = {}
-    client_logs = []
-    frame_id = 0
-    last_score_time = time.time()
-
+cap.set(cv2.CAP_PROP_POS_MSEC, 1000)
+ret, frame = cap.read()
+if ret:
+    frame_copy = frame.copy()
+    cv2.namedWindow('Select Client Zone')
+    cv2.setMouseCallback('Select Client Zone', draw_rectangle)
     while True:
-        ret, frame = cap.read();
-        if not ret: break
-        frame_id += 1
-        now = time.time()
+        cv2.imshow('Select Client Zone', frame_copy)
+        if cv2.waitKey(1) & 0xFF == ord('q') or rect_drawn:
+            break
+    cv2.destroyWindow('Select Client Zone')
+cap.set(cv2.CAP_PROP_POS_MSEC, 0)
 
-        res = model.predict(frame, imgsz=1024, conf=0.25, classes=[0], verbose=False)
-        dets = []
-        if len(res) > 0:
-            r = res[0]
-            if r.boxes is not None and len(r.boxes) > 0:
-                for box in r.boxes:
-                    x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-                    conf = float(box.conf[0].item()) if hasattr(box, 'conf') else 1.0
-                    dets.append([x1,y1,x2,y2,conf])
-        tracks = tracker.update(dets, frame_id)
+monitoring_mode = True
 
-        annotated = frame.copy()
-        for tr in tracks:
-            tid = int(tr.track_id)
-            x1,y1,x2,y2 = map(int,tr.tlbr)
-            cv2.rectangle(annotated,(x1,y1),(x2,y2),(0,255,0),2)
-            cv2.putText(annotated,f"ID:{tid}",(x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),2)
+# Current scores for display (initialize to 0)
+current_face_sc = 0
+current_body_sc = 0
+current_agg_sc = 0
 
-            ov = box_overlap((x1,y1,x2,y2), zone)
-            if ov > 0.6:
-                if tid not in active_clients:
-                    active_clients[tid] = {'start': now, 'frames': [], 'last_seen': now, 'pose': collections.deque(maxlen=HISTORY_LEN), 'scores': []}
-                active_clients[tid]['last_seen'] = now
-                active_clients[tid]['frames'].append((frame_id,(x1,y1,x2,y2)))
+# Agg history for graph
+agg_history = []
 
-                # try to extract pose keypoints if available
-                if res and hasattr(r,'keypoints') and r.keypoints is not None and len(r.keypoints)>0:
-                    for i,kp in enumerate(r.keypoints):
-                        if r.boxes is not None and i < len(r.boxes):
-                            b = r.boxes[i]
-                            bid = getattr(b,'id',None)
-                        # assume matching by IoU: skip robust matching for brevity
-                    # attempt: if keypoints present, pick nearest box
-                    if r.keypoints is not None and len(r.keypoints)>0:
-                        kps = r.keypoints[0].data.cpu().numpy()
-                        pts = kps[0,:,:2]
-                        pts[:,0] /= fw; pts[:,1] /= fh
-                        low_conf = kps[0,:,2] < 0.5
-                        pts[low_conf] = 0
-                        if pts.shape[0] >= 17:
-                            active_clients[tid]['pose'].append(pts)
+# --------------------------------------------------------------
+#  NEW: Insight overlay (replaces TTS)
+# --------------------------------------------------------------
+insight_text   = ""          # text to show
+insight_start  = 0.0         # time when it appeared
+INSIGHT_DURATION = 5.0       # seconds to keep it on screen
 
-                # face
-                face_box, face_landmarks = get_face_for_person(frame, (x1,y1,x2,y2), now)
-                if face_landmarks:
-                    _, face_sc, _ = compute_face_expression_score(face_landmarks, fw, fh, prev_face_scores.get(tid))
-                    prev_face_scores[tid] = face_sc
+# Set larger window
+cv2.namedWindow("YOLO + Pose + Face (Satisfaction)", cv2.WINDOW_NORMAL)
+# cv2.resizeWindow("YOLO + Pose + Face (Satisfaction)", 1200, 900)
+
+# OpenRouter setup
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY")
+)
+
+def generate_insight(total_time, mean_posture, mean_face, mean_total, client_scores):
+    prompt = f"""
+Customer stayed for {total_time:.1f} seconds.
+Mean posture score: {mean_posture:.1f}/100
+Mean face score: {mean_face:.1f}/100
+Total mean satisfaction: {mean_total:.1f}/100
+Scores over time (posture, face, total): {client_scores}
+
+Give a short, professional insight (1-2 sentences) about possible customer mood or service issue.
+Focus on trends in posture (e.g. crossed arms = bored/impatient) and face expressions.
+"""
+    response = client.chat.completions.create(
+        model="meta-llama/llama-3-8b-instruct",
+        messages=[
+            {"role": "system", "content": "You are a customer service analyst. Be concise, professional, and insightful."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=100
+    )
+    return response.choices[0].message.content.strip()
+
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+
+    fh, fw = frame.shape[:2]
+
+    results  = model.track(frame, persist=True, classes=[0], verbose=False)
+    annotated = frame.copy()
+    now = time.monotonic()
+
+    # Phase 2: Monitor clients in client_box
+    active_tracks_in_box = []
+    for box in results[0].boxes:
+        if box.id is None: continue
+        tid = int(box.id.item())
+        x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
+
+        overlap = box_overlap((x1,y1,x2,y2), client_box)
+        if overlap >= LEAVING_THRESHOLD:
+            active_tracks_in_box.append((tid, overlap, (x1,y1,x2,y2)))
+
+    front_tid = None
+    if active_tracks_in_box:
+        high_overlap_candidates = [t for t in active_tracks_in_box if t[1] >= ENTERING_THRESHOLD]
+        current_overlap = next((ov for tid,ov,_ in active_tracks_in_box if tid == current_client_tid), 0.0)
+        if current_overlap > 0:
+            front_tid = current_client_tid
+        elif high_overlap_candidates:
+            high_overlap_candidates.sort(key=lambda x: x[1], reverse=True)
+            front_tid = high_overlap_candidates[0][0]
+
+    if front_tid is not None:
+        if current_client_tid is None or current_client_tid != front_tid:
+            if current_client_tid is not None:
+                total_time = now - client_start_time
+                if client_scores:
+                    posture_scores = [s[0] for s in client_scores]
+                    face_scores    = [s[1] for s in client_scores]
+                    agg_scores     = [s[2] for s in client_scores]
+                    mean_posture   = np.mean(posture_scores)
+                    mean_face      = np.mean(face_scores)
+                    mean_total     = np.mean(agg_scores)
                 else:
-                    face_sc = 0
+                    mean_posture = mean_face = mean_total = 0
 
-                if len(active_clients[tid]['pose'])>=3 and (now - last_score_time) >= SCORE_INTERVAL:
-                    last_score_time = now
-                    _, body_sc, _ = compute_satisfaction_score(active_clients[tid]['pose'], fw, fh, prev_body_scores.get(tid))
-                    prev_body_scores[tid] = body_sc
-                    # transaction check
-                    trans, diag = compute_transaction_indicators(list(active_clients[tid]['pose']), fw, fh)
-                    active_clients[tid]['scores'].append((body_sc, face_sc, (body_sc+face_sc)/2 if (body_sc+face_sc)>0 else 0))
-                    if trans == 'potential_transaction':
-                        active_clients[tid]['transaction_at'] = now
+                print(f"[{time.strftime('%H:%M:%S')}] Client ID {current_client_tid} left.")
+                print(f"Time spent: {total_time:.1f}s")
+                print(f"Scores list: {client_scores}")
+                print(f"Mean posture: {mean_posture:.1f}")
+                print(f"Mean face: {mean_face:.1f}")
+                print(f"Total mean score: {mean_total:.1f}")
+                client_logs.append((current_client_tid, total_time, mean_posture, mean_face, mean_total))
 
+                # ----  NEW: show insight on screen  ----
+                insight = generate_insight(total_time, mean_posture, mean_face, mean_total, client_scores)
+                print("Insight:", insight)
+                insight_text   = insight
+                insight_start  = now
+
+            current_client_tid = front_tid
+            client_start_time  = now
+            client_scores      = []
+            last_score_time    = now
+            agg_history = []
+            insight_text = ""          # hide previous insight
+            print(f"[{time.strftime('%H:%M:%S')}] New client ID {front_tid} entered.")
+
+        # Process pose/face/draw for current_client_tid
+        tid = current_client_tid
+        if tid not in landmark_histories:
+            landmark_histories[tid]       = collections.deque(maxlen=HISTORY_LEN)
+            torso_activity_histories[tid] = collections.deque(maxlen=5)
+            prev_body_scores[tid]         = None
+            prev_face_scores[tid]         = None
+
+        person_bbox = next(b for t,o,b in active_tracks_in_box if t == tid)
+        x1, y1, x2, y2 = person_bbox
+
+        has_pose = False
+        pts = None
+        if results[0].keypoints is not None and len(results[0].keypoints) > 0:
+            for i, kp in enumerate(results[0].keypoints):
+                if results[0].boxes[i].id is not None and int(results[0].boxes[i].id.item()) == tid:
+                    keypoints = kp.data.cpu().numpy()  # Shape: (1, 17, 3) -> [x, y, conf]
+                    pts = keypoints[0, :, :2]  # Extract [x,y] for 17 keypoints
+                    confidences = keypoints[0, :, 2]
+                    # Filter low-conf keypoints
+                    low_conf_mask = confidences < 0.5
+                    pts[low_conf_mask] = [0, 0]
+                    # Normalize to [0,1]
+                    pts[:, 0] /= fw
+                    pts[:, 1] /= fh
+                    has_pose = True
+                    # Draw pose mesh
+                    for idx1, idx2 in COCO_CONNECTIONS:
+                        if np.all(pts[idx1] != 0) and np.all(pts[idx2] != 0):
+                            pt1 = (int(pts[idx1][0] * fw), int(pts[idx1][1] * fh))
+                            pt2 = (int(pts[idx2][0] * fw), int(pts[idx2][1] * fh))
+                            cv2.line(annotated, pt1, pt2, (255, 0, 0), 2)
+                    break
+
+        # Face detection
+        face_box, face_crop = get_face_for_person(person_bbox, now)
+
+        # Draw face box
+        if face_box:
+            fx1, fy1, fx2, fy2 = face_box
+            cv2.rectangle(annotated, (fx1, fy1), (fx2, fy2), (0, 255, 255), 2)
+
+        # Draw green box for current client
+        cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,255,0), 2)
+        cv2.putText(annotated, f"ID:{tid}", (x1, y1+20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+        if has_pose and pts is not None and pts.shape[0] >= 17:
+            landmark_histories[tid].append(pts)
+
+        # Compute scores every second
+        if now - last_score_time >= SCORE_INTERVAL:
+            last_score_time = now
+
+            # Posture
+            body_sc = 0
+            if tid in landmark_histories and len(landmark_histories[tid]) >= 3:
+                _, body_sc, _ = compute_satisfaction_score(
+                    landmark_histories[tid], fw, fh,
+                    prev_body_scores.get(tid))
+                prev_body_scores[tid] = body_sc
+
+            # Face
+            face_sc = 0
+            if face_crop is not None:
+                _, face_sc, _ = compute_face_expression_score(
+                    face_crop, 
+                    prev_face_scores.get(tid))
+                prev_face_scores[tid] = face_sc
+
+            # Agg - if no face, use posture only
+            scores = [s for s in (body_sc, face_sc) if s > 0]
+            agg_sc = sum(scores)/len(scores) if scores else 0
+
+            client_scores.append((body_sc, face_sc, agg_sc))
+            agg_history.append(agg_sc)
+
+            # Update current scores for display
+            current_face_sc = face_sc
+            current_body_sc = body_sc
+            current_agg_sc = agg_sc
+
+    else:
+        # No one in box → log if current was there
+        if current_client_tid is not None:
+            total_time = now - client_start_time
+            if client_scores:
+                posture_scores = [s[0] for s in client_scores]
+                face_scores    = [s[1] for s in client_scores]
+                agg_scores     = [s[2] for s in client_scores]
+                mean_posture   = np.mean(posture_scores)
+                mean_face      = np.mean(face_scores)
+                mean_total     = np.mean(agg_scores)
             else:
-                if tid in active_clients:
-                    elapsed = now - active_clients[tid]['start']
-                    scores = active_clients[tid]['scores']
-                    if scores:
-                        posture = float(np.mean([s[0] for s in scores]))
-                        face = float(np.mean([s[1] for s in scores]))
-                        agg = float(np.mean([s[2] for s in scores]))
-                    else:
-                        posture=face=agg=0.0
-                    client_logs.append({'zone':zones[zone_index]['label'],'track_id':tid,'enter_time':active_clients[tid]['start'],'leave_time':now,'duration':elapsed,'mean_posture':posture,'mean_face':face,'mean_agg':agg,'frames':len(active_clients[tid]['frames']), 'transaction_at': active_clients[tid].get('transaction_at',None)})
-                    del active_clients[tid]
+                mean_posture = mean_face = mean_total = 0
 
-        x1,y1,x2,y2 = zone
-        cv2.rectangle(annotated,(x1,y1),(x2,y2),(255,0,0),2)
-        cv2.imshow('service_monitor', annotated)
-        if cv2.waitKey(1) == 27: break
+            print(f"[{time.strftime('%H:%M:%S')}] Client ID {current_client_tid} left.")
+            print(f"Time spent: {total_time:.1f}s")
+            print(f"Scores list: {client_scores}")
+            print(f"Mean posture: {mean_posture:.1f}")
+            print(f"Mean face: {mean_face:.1f}")
+            print(f"Total mean score: {mean_total:.1f}")
+            client_logs.append((current_client_tid, total_time, mean_posture, mean_face, mean_total))
 
-    for tid, info in active_clients.items():
-        elapsed = time.time() - info['start']
-        scores = info['scores']
-        if scores:
-            posture = float(np.mean([s[0] for s in scores]))
-            face = float(np.mean([s[1] for s in scores]))
-            agg = float(np.mean([s[2] for s in scores]))
+            # ----  NEW: show insight on screen  ----
+            insight = generate_insight(total_time, mean_posture, mean_face, mean_total, client_scores)
+            print("Insight:", insight)
+            insight_text   = insight
+            insight_start  = now
+
+            current_client_tid = None
+
+    # Draw client box
+    if client_box:
+        cv2.rectangle(annotated, (client_box[0], client_box[1]), (client_box[2], client_box[3]), (255,0,0), 2)
+
+# Display satisfaction levels on top left of the frame
+    cv2.putText(annotated, f"face : {current_face_sc}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(annotated, f"posture : {current_body_sc}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(annotated, f"total : {current_agg_sc}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    # Display chronometer in top right corner if a client is present
+    if current_client_tid is not None:
+        elapsed = now - client_start_time
+        chron_text = f"Client Time: {elapsed:.1f}s"
+        text_size = cv2.getTextSize(chron_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        chron_x = fw - text_size[0] - 15
+        chron_y = 35
+        cv2.putText(
+            annotated,
+            chron_text,
+            (chron_x, chron_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    # Draw graph if in monitoring mode and have data
+    if monitoring_mode:
+        graph_height = 200                     # same as in draw_satisfaction_graph
+        canvas = np.full((graph_height + 120, annotated.shape[1], 3), 255, dtype=np.uint8)  # white bg
+
+        # ---- draw the line-chart -------------------------------------------------
+        if len(agg_history) > 0:
+            max_x = annotated.shape[1] - 100
+            max_y = graph_height - 100
+            points = []
+            for i, score in enumerate(agg_history):
+                x = 50 + int(i * max_x / max(1, len(agg_history) - 1))
+                y = (graph_height - 50) - int(score / 100 * max_y)
+                points.append((x, y))
+                cv2.circle(canvas, (x, y), 3, (0, 0, 255), -1)
+            for i in range(1, len(points)):
+                cv2.line(canvas, points[i-1], points[i], (0, 0, 255), 2)
+
+            # axes + labels
+            cv2.line(canvas, (50, graph_height - 50), (annotated.shape[1] - 50, graph_height - 50), (0,0,0), 2)
+            cv2.line(canvas, (50, graph_height - 50), (50, 50), (0,0,0), 2)
+            cv2.putText(canvas, "0",   (30, graph_height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+            cv2.putText(canvas, "100", (20, 60),               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+            cv2.putText(canvas, "Satisfaction over time", (annotated.shape[1]//2 - 100, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
         else:
-            posture=face=agg=0.0
-        client_logs.append({'zone':zones[zone_index]['label'],'track_id':tid,'enter_time':info['start'],'leave_time':time.time(),'duration':elapsed,'mean_posture':posture,'mean_face':face,'mean_agg':agg,'frames':len(info['frames']),'transaction_at': info.get('transaction_at',None)})
+            cv2.putText(canvas, "No data yet", (10, graph_height // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
 
-    with open(out_csv,'w') as f:
-        f.write('zone,track_id,enter_time,leave_time,duration,mean_posture,mean_face,mean_agg,frames,transaction_at\n')
-        for c in client_logs:
-            f.write(f"{c['zone']},{c['track_id']},{c['enter_time']},{c['leave_time']},{c['duration']},{c['mean_posture']},{c['mean_face']},{c['mean_agg']},{c['frames']},{c['transaction_at']}\n")
+        # ---- draw the insight paragraph (wrapped) --------------------------------
+        if insight_text and now - insight_start < INSIGHT_DURATION:
+            # wrap long text
+            max_line_w = annotated.shape[1] - 100
+            words = insight_text.split()
+            lines = []
+            cur = ""
+            for w in words:
+                test = cur + " " + w if cur else w
+                if cv2.getTextSize(test, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0][0] <= max_line_w:
+                    cur = test
+                else:
+                    lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            y0 = graph_height + 30
+            for i, line in enumerate(lines):
+                cv2.putText(canvas, line, (50, y0 + i*25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
+        # -------------------------------------------------------------------------
 
-if __name__ == '__main__':
-    # usage: edit paths accordingly and run in your NVIDIA Jupyter
-    video_path = './testcases/siu.mp4'
-    pixelrefer_json = './pixelrefer_output.json'  # produced by PixelRefer demo
-    run(video_path, pixelrefer_json=pixelrefer_json, zone_index=0)
+        # stack canvas under the original frame
+        annotated = np.vstack((annotated, canvas))
+    # ----  Draw insight overlay if active  ----
+    # if insight_text and now - insight_start < INSIGHT_DURATION:
+    #     # background rectangle
+    #     txt_size = cv2.getTextSize(insight_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    #     bg_x1 = 10
+    #     bg_y1 = fh - 80
+    #     bg_x2 = bg_x1 + txt_size[0] + 20
+    #     bg_y2 = bg_y1 + txt_size[1] + 20
+    #     cv2.rectangle(annotated, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
+    #     cv2.rectangle(annotated, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), 2)
+
+    #     # text
+    #     cv2.putText(
+    #         annotated,
+    #         insight_text,
+    #         (bg_x1 + 10, bg_y1 + txt_size[1] + 10),
+    #         cv2.FONT_HERSHEY_SIMPLEX,
+    #         0.7,
+    #         (255, 255, 255),
+    #         2,
+    #         cv2.LINE_AA,
+    #     )
+    # else:
+    #     # clear when time is up
+    #     insight_text = ""
+
+    cv2.imshow("YOLO + Pose + Face (Satisfaction)", annotated)
+    key = cv2.waitKey(1) & 0xFF
+    if key == 27:                     # Esc
+        esc_pressed = True
+        insight_text = ""             # hide any current insight
+        break
+
+# After video ends, log the last client if still present
+if current_client_tid is not None:
+    total_time = now - client_start_time
+    if client_scores:
+        posture_scores = [s[0] for s in client_scores]
+        face_scores    = [s[1] for s in client_scores]
+        agg_scores     = [s[2] for s in client_scores]
+        mean_posture   = np.mean(posture_scores)
+        mean_face      = np.mean(face_scores)
+        mean_total     = np.mean(agg_scores)
+    else:
+        mean_posture = mean_face = mean_total = 0
+
+    print(f"[{time.strftime('%H:%M:%S')}] Client ID {current_client_tid} left (video end).")
+    print(f"Time spent: {total_time:.1f}s")
+    print(f"Scores list: {client_scores}")
+    print(f"Mean posture: {mean_posture:.1f}")
+    print(f"Mean face: {mean_face:.1f}")
+    print(f"Total mean score: {mean_total:.1f}")
+    client_logs.append((current_client_tid, total_time, mean_posture, mean_face, mean_total))
+
+    # ----  NEW: show insight on screen  ----
+    if not esc_pressed:
+        insight = generate_insight(total_time, mean_posture, mean_face, mean_total, client_scores)
+        print("Insight:", insight)
+        insight_text   = insight
+        insight_start  = now
+    else:
+        print("[ESC] Insight generation skipped.")
+
+# Final logs
+print("All client logs:")
+for log in client_logs:
+    print(log)
+
+cap.release()
+cv2.destroyAllWindows()

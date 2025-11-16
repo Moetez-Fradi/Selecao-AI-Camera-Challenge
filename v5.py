@@ -10,7 +10,7 @@ import urllib.request
 from tqdm import tqdm
 
 model = YOLO("yolov8x-pose.pt")
-cap   = cv2.VideoCapture("./testcases/siu.mp4")
+cap   = cv2.VideoCapture("./testcases/preview.mp4")
 
 mp_face = mp.solutions.face_mesh
 face_mesh = mp_face.FaceMesh(
@@ -45,7 +45,7 @@ ARM_ACTIVITY_THRESHOLD    = 0.005
 MIN_SHOULDER_WIDTH_FRAC   = 0.10     # smaller people are OK
 STATIONARY_SECONDS        = 4.0      # Adjusted as per user
 
-CLIENT_BOX_SCALE_W = 3  # Width scale
+CLIENT_BOX_SCALE_W = 2.5  # Width scale
 CLIENT_BOX_SCALE_H = 1  # Height scale
 SCORE_INTERVAL   = 1.0  # Compute scores every 1 second
 CENTROID_DISP_THRESH = 0.05  # Relaxed to 0.05 (5% of frame) for "close to same place"
@@ -639,13 +639,21 @@ while True:
 
     # Display chronometer in top right corner if a client is present
     if current_client_tid is not None:
-        elapsed = now - client_start_time + guichet_start_time
+        elapsed = now - client_start_time
         chron_text = f"Client Time: {elapsed:.1f}s"
         text_size = cv2.getTextSize(chron_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
-        chron_x = fw - text_size[0] - 10
-        chron_y = 30
-        cv2.putText(annotated, chron_text, (chron_x, chron_y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
+        chron_x = fw - text_size[0] - 15
+        chron_y = 35
+        cv2.putText(
+            annotated,
+            chron_text,
+            (chron_x, chron_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
     # Draw graph if in monitoring mode and have data
     if monitoring_mode and len(agg_history) > 0:
         annotated = draw_satisfaction_graph(annotated, agg_history, annotated.shape[1])
