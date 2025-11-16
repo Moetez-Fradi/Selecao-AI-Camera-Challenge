@@ -1,0 +1,4 @@
+__pycache__/
+.venv/
+yolo*.pt
+*.mp4
