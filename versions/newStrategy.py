@@ -7,24 +7,24 @@ from ultralytics import YOLO
 import mediapipe as mp 
 
 
-model =YOLO ("yolov8x-pose.pt")
-cap =cv2 .VideoCapture ("./testcases/siu.mp4")
+model =YOLO ("yolov8m.pt")
+cap =cv2 .VideoCapture ("./testcases/preview.mp4")
+
+mp_pose =mp .solutions .pose 
+pose =mp_pose .Pose (model_complexity =1 ,enable_segmentation =False )
 
 mp_face =mp .solutions .face_mesh 
 face_mesh =mp_face .FaceMesh (
 static_image_mode =False ,
 max_num_faces =4 ,
 refine_landmarks =True ,
-min_detection_confidence =0.3 ,
-min_tracking_confidence =0.3 
+min_detection_confidence =0.4 ,
+min_tracking_confidence =0.4 
 )
 
 mp_drawing =mp .solutions .drawing_utils 
 
-
-face_cascade =cv2 .CascadeClassifier (cv2 .data .haarcascades +'haarcascade_frontalface_default.xml')
-
-HISTORY_LEN =20 
+HISTORY_LEN =10 
 TORSO_ACTIVITY_THRESHOLD =0.0025 
 ARM_ACTIVITY_THRESHOLD =0.005 
 MIN_SHOULDER_WIDTH_FRAC =0.10 
@@ -37,14 +37,6 @@ OVERLAP_THRESH =0.5
 SCORE_INTERVAL =1.0 
 CENTROID_DISP_THRESH =0.05 
 
-EYE_CONF_THRESHOLD =0.5 
-
-
-COCO_CONNECTIONS =[
-(0 ,1 ),(0 ,2 ),(1 ,3 ),(2 ,4 ),(0 ,5 ),(0 ,6 ),(5 ,7 ),(7 ,9 ),(6 ,8 ),(8 ,10 ),
-(5 ,6 ),(5 ,11 ),(6 ,12 ),(11 ,13 ),(13 ,15 ),(12 ,14 ),(14 ,16 ),(11 ,12 )
-]
-
 
 def _angle_between_deg (v1 ,v2 ):
     n1 =np .linalg .norm (v1 );n2 =np .linalg .norm (v2 )
@@ -52,28 +44,28 @@ def _angle_between_deg (v1 ,v2 ):
     c =np .clip (np .dot (v1 ,v2 )/(n1 *n2 ),-1.0 ,1.0 )
     return math .degrees (math .acos (c ))
 
-def _clamp01 (x ):return max (0.0 ,min (1.0 ,x ))
+def _clamp01 (x ):
+    return max (0.0 ,min (1.0 ,x ))
+
 def _map_to_01 (v ,a ,b ):
     if b ==a :return 0.0 
     return _clamp01 ((v -a )/(b -a ))
-
 
 def compute_satisfaction_score (history ,fw ,fh ,prev_score =None ,alpha =0.6 ):
     if len (history )<3 :return None ,0 ,{}
     pts_now =history [-1 ]
     pts_prev =history [-2 ]
     pts_old =history [-3 ]
-    if pts_now .shape [0 ]<17 :return None ,0 ,{}
+    if pts_now .shape [0 ]<25 :return None ,0 ,{}
 
     disp1 =np .linalg .norm (pts_now -pts_prev ,axis =1 )
     disp2 =np .linalg .norm (pts_prev -pts_old ,axis =1 )
     activity =float ((disp1 .mean ()+disp2 .mean ())/2.0 )
 
-    L_SH ,R_SH =5 ,6 
-    L_HIP ,R_HIP =11 ,12 
+    L_SH ,R_SH =11 ,12 
+    L_HIP ,R_HIP =23 ,24 
     NOSE =0 
-    L_ELB ,R_ELB =7 ,8 
-    L_WRIST ,R_WRIST =9 ,10 
+    L_WRIST ,R_WRIST =15 ,16 
 
     shoulders =(pts_now [L_SH ]+pts_now [R_SH ])/2.0 
     hips =(pts_now [L_HIP ]+pts_now [R_HIP ])/2.0 
@@ -101,27 +93,14 @@ def compute_satisfaction_score (history ,fw ,fh ,prev_score =None ,alpha =0.6 ):
     np .linalg .norm (pts_now [R_WRIST ]-nose ))
     hands_face =_map_to_01 (wrist_to_nose ,0.01 ,0.20 )
 
-
-    crossed_arms_penalty =0.0 
-    if all (pts_now [i ].any ()for i in [L_ELB ,R_ELB ,L_WRIST ,R_WRIST ,L_SH ,R_SH ,L_HIP ,R_HIP ]):
-
-        if (pts_now [L_WRIST ][0 ]>pts_now [R_SH ][0 ]and pts_now [R_WRIST ][0 ]<pts_now [L_SH ][0 ])or (pts_now [L_WRIST ][0 ]>pts_now [R_ELB ][0 ]and pts_now [R_WRIST ][0 ]<pts_now [L_ELB ][0 ]):
-
-            chest_y_min =min (pts_now [L_SH ][1 ],pts_now [R_SH ][1 ])
-            chest_y_max =max (pts_now [L_HIP ][1 ],pts_now [R_HIP ][1 ])
-            if chest_y_min <pts_now [L_WRIST ][1 ]<chest_y_max and chest_y_min <pts_now [R_WRIST ][1 ]<chest_y_max :
-                crossed_arms_penalty =0.25 
-
     activity_score =_map_to_01 (activity ,0.0008 ,0.018 )
     upright_score =1.0 if torso_angle <=10 else 0.0 if torso_angle >=40 else 1.0 -((torso_angle -10 )/(40 -10 ))
     head_align_score =_clamp01 (1.0 -(head_torso_angle /40.0 ))
     shoulder_sym_score =1.0 -_clamp01 (shoulder_sym *3.0 )
     hands_open_score =hands_face 
-    arm_open_score =arm_openness 
 
-    combined =(0.30 *upright_score +0.25 *activity_score +0.15 *hands_open_score +
-    0.15 *arm_open_score +0.10 *head_align_score +0.05 *shoulder_sym_score )
-    combined -=crossed_arms_penalty 
+    combined =(0.35 *upright_score +0.30 *activity_score +0.15 *hands_open_score +
+    0.12 *head_align_score +0.08 *shoulder_sym_score )
     combined =_clamp01 (combined )
 
     if prev_score is not None :
@@ -131,7 +110,6 @@ def compute_satisfaction_score (history ,fw ,fh ,prev_score =None ,alpha =0.6 ):
     label ="satisfied"if score >=70 else "neutral"if score >=45 else "dissatisfied"
 
     return label ,score ,{}
-
 
 def compute_face_expression_score (face_landmarks ,fw ,fh ,prev_score =None ,alpha =0.6 ):
     if face_landmarks is None :return None ,0 ,{}
@@ -162,22 +140,21 @@ def compute_face_expression_score (face_landmarks ,fw ,fh ,prev_score =None ,alp
     label ="satisfied"if score >=70 else "neutral"if score >=45 else "dissatisfied"
     return label ,score ,{}
 
-
 def compute_transaction_indicators (history ,fw ,fh ):
     if len (history )<3 :return None ,{}
     pts_now =history [-1 ];pts_prev =history [-2 ];pts_old =history [-3 ]
-    if pts_now .shape [0 ]<17 :return None ,{}
+    if pts_now .shape [0 ]<25 :return None ,{}
 
     disp1 =np .linalg .norm (pts_now -pts_prev ,axis =1 )
     disp2 =np .linalg .norm (pts_prev -pts_old ,axis =1 )
 
-    torso_pts =[5 ,6 ,11 ,12 ]
-    arm_pts =[7 ,8 ,9 ,10 ]
+    torso_pts =[11 ,12 ,23 ,24 ]
+    arm_pts =[13 ,14 ,15 ,16 ]
 
     torso_disp =(disp1 [torso_pts ].mean ()+disp2 [torso_pts ].mean ())/2.0 
     arm_disp =(disp1 [arm_pts ].mean ()+disp2 [arm_pts ].mean ())/2.0 
 
-    shoulders =(pts_now [5 ]+pts_now [6 ])/2.0 
+    shoulders =(pts_now [11 ]+pts_now [12 ])/2.0 
     nose =pts_now [0 ]
     head_vec =nose -shoulders 
     head_len =np .linalg .norm (head_vec )+1e-6 
@@ -185,7 +162,7 @@ def compute_transaction_indicators (history ,fw ,fh ):
     cam_dir =np .array ([0.0 ,-1.0 ])
     facing_angle =_angle_between_deg (head_dir ,cam_dir )
 
-    shoulder_width =np .linalg .norm (pts_now [5 ]-pts_now [6 ])*fw 
+    shoulder_width =np .linalg .norm (pts_now [11 ]-pts_now [12 ])*fw 
     shoulder_frac =shoulder_width /fw 
 
     diag ={"torso_activity":torso_disp ,"arm_activity":arm_disp ,
@@ -196,7 +173,6 @@ def compute_transaction_indicators (history ,fw ,fh ):
     shoulder_frac >MIN_SHOULDER_WIDTH_FRAC )
 
     return "potential_transaction"if is_transaction else None ,diag 
-
 
 landmark_histories ={}
 torso_activity_histories ={}
@@ -250,53 +226,7 @@ def compute_centroid_disp (bbox_list ,fw ,fh ):
     return np .mean (disps )
 
 
-def draw_satisfaction_graph (frame ,agg_history ,fw ,graph_height =200 ):
-    if len (agg_history )==0 :
-        return frame 
-
-    graph_frame =np .zeros ((graph_height ,frame .shape [1 ],3 ),dtype =np .uint8 )+255 
-    if len (agg_history )<2 :
-        cv2 .putText (graph_frame ,"No data yet",(10 ,graph_height //2 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,0 ,0 ),2 )
-    else :
-
-        cv2 .line (graph_frame ,(50 ,graph_height -50 ),(frame .shape [1 ]-50 ,graph_height -50 ),(0 ,0 ,0 ),2 )
-        cv2 .line (graph_frame ,(50 ,graph_height -50 ),(50 ,50 ),(0 ,0 ,0 ),2 )
-        cv2 .putText (graph_frame ,"0",(30 ,graph_height -40 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.5 ,(0 ,0 ,0 ),1 )
-        cv2 .putText (graph_frame ,"100",(20 ,60 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.5 ,(0 ,0 ,0 ),1 )
-        cv2 .putText (graph_frame ,"Satisfaction over time",(frame .shape [1 ]//2 -100 ,30 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,0 ,0 ),2 )
-
-
-        max_x =frame .shape [1 ]-100 
-        max_y =graph_height -100 
-        points =[]
-        for i ,score in enumerate (agg_history ):
-            x =50 +int (i *max_x /max (1 ,(len (agg_history )-1 )))
-            y =(graph_height -50 )-int (score /100 *max_y )
-            points .append ((x ,y ))
-            cv2 .circle (graph_frame ,(x ,y ),3 ,(0 ,0 ,255 ),-1 )
-
-
-        for i in range (1 ,len (points )):
-            cv2 .line (graph_frame ,points [i -1 ],points [i ],(0 ,0 ,255 ),2 )
-
-
-    frame_with_graph =np .vstack ((frame ,graph_frame ))
-    return frame_with_graph 
-
-
 monitoring_mode =False 
-
-
-current_face_sc =0 
-current_body_sc =0 
-current_agg_sc =0 
-
-
-agg_history =[]
-
-
-cv2 .namedWindow ("YOLO + Pose + Face (Satisfaction)",cv2 .WINDOW_NORMAL )
-
 
 while True :
     ret ,frame =cap .read ()
@@ -305,6 +235,7 @@ while True :
     fh ,fw =frame .shape [:2 ]
     rgb =cv2 .cvtColor (frame ,cv2 .COLOR_BGR2RGB )
 
+    pose_res =pose .process (rgb )
     face_res =face_mesh .process (rgb )
 
     results =model .track (frame ,persist =True ,classes =[0 ],verbose =False )
@@ -355,24 +286,7 @@ while True :
         if current_candidates :
             best_tid =max (current_candidates ,key =lambda tid :current_candidates [tid ][0 ])
             _ ,best_centroid ,_ =current_candidates [best_tid ]
-
-
-            facing_camera =False 
-            if results [0 ].keypoints is not None :
-                for i in range (len (results [0 ].boxes )):
-                    if results [0 ].boxes [i ].id is not None and int (results [0 ].boxes [i ].id .item ())==best_tid :
-                        keypoints =results [0 ].keypoints .data [i ].cpu ().numpy ()
-                        confidences =keypoints [:,2 ]
-                        left_eye_conf =confidences [1 ]
-                        right_eye_conf =confidences [2 ]
-                        if left_eye_conf >EYE_CONF_THRESHOLD and right_eye_conf >EYE_CONF_THRESHOLD :
-                            facing_camera =True 
-                        break 
-
-            if facing_camera :
-                transaction_locations .append (best_centroid )
-            else :
-                print (f"[{time .strftime ('%H:%M:%S')}] Ignored candidate ID {best_tid }: not facing camera (eyes not detected).")
+            transaction_locations .append (best_centroid )
 
 
         if len (transaction_locations )>10 :
@@ -385,7 +299,7 @@ while True :
                 guichet_loc =np .mean (locs [lbls ==main ],axis =0 ).astype (int )
 
 
-                avg_w =np .mean ([bbox_area (b )for hist in bbox_histories .values ()for b in hist if hist ])**0.5 
+                avg_w =np .mean ([bbox_area (b )for hist in bbox_histories .values ()for b in hist ])**0.5 
                 avg_h =avg_w *1.5 
                 cx ,cy =guichet_loc 
                 client_box =(int (cx -avg_w /2 *CLIENT_BOX_SCALE_W ),
@@ -419,29 +333,19 @@ while True :
                     has_pose =False 
                     face_landmarks =None 
 
+                    if pose_res .pose_landmarks :
+                        lm =pose_res .pose_landmarks .landmark 
+                        pts =np .array ([[p .x ,p .y ]for p in lm ],dtype =np .float32 )
+                        nx1 ,ny1 ,nx2 ,ny2 =x1 /fw ,y1 /fh ,x2 /fw ,y2 /fh 
+                        if nx1 <=pts [0 ][0 ]<=nx2 and ny1 <=pts [0 ][1 ]<=ny2 :
+                            has_pose =True 
+                            landmark_histories [tid ].append (pts )
 
-                    pts =None 
-                    if results [0 ].keypoints is not None and len (results [0 ].keypoints )>0 :
-                        for i ,kp in enumerate (results [0 ].keypoints ):
-                            if results [0 ].boxes [i ].id is not None and int (results [0 ].boxes [i ].id .item ())==tid :
-                                keypoints =kp .data .cpu ().numpy ()
-                                pts =keypoints [0 ,:,:2 ]
-                                confidences =keypoints [0 ,:,2 ]
 
-                                low_conf_mask =confidences <0.5 
-                                pts [low_conf_mask ]=[0 ,0 ]
-
-                                pts [:,0 ]/=fw 
-                                pts [:,1 ]/=fh 
-                                has_pose =True 
-
-                                for idx1 ,idx2 in COCO_CONNECTIONS :
-                                    if np .all (pts [idx1 ]!=0 )and np .all (pts [idx2 ]!=0 ):
-                                        pt1 =(int (pts [idx1 ][0 ]*fw ),int (pts [idx1 ][1 ]*fh ))
-                                        pt2 =(int (pts [idx2 ][0 ]*fw ),int (pts [idx2 ][1 ]*fh ))
-                                        cv2 .line (annotated ,pt1 ,pt2 ,(255 ,0 ,0 ),2 )
-                                break 
-
+                            mp_drawing .draw_landmarks (
+                            annotated ,pose_res .pose_landmarks ,mp_pose .POSE_CONNECTIONS ,
+                            landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
+                            connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =2 ))
 
                     if face_res .multi_face_landmarks :
                         for f_lm in face_res .multi_face_landmarks :
@@ -456,36 +360,10 @@ while True :
                                 landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
                                 connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =1 ))
                                 break 
-                    if face_landmarks is None :
-                        gray =cv2 .cvtColor (frame ,cv2 .COLOR_BGR2GRAY )
-                        haar_faces =face_cascade .detectMultiScale (gray ,scaleFactor =1.1 ,minNeighbors =5 ,minSize =(30 ,30 ))
-                        for (fx ,fy ,fw ,fh )in haar_faces :
-                            if max (x1 ,fx )<min (x2 ,fx +fw )and max (y1 ,fy )<min (y2 ,fy +fh ):
-
-                                face_crop =frame [fy :fy +fh ,fx :fx +fw ]
-                                rgb_crop =cv2 .cvtColor (face_crop ,cv2 .COLOR_BGR2RGB )
-                                crop_res =face_mesh .process (rgb_crop )
-                                if crop_res .multi_face_landmarks :
-                                    f_lm =crop_res .multi_face_landmarks [0 ]
-
-                                    for lm in f_lm .landmark :
-                                        lm .x =lm .x *(fw /frame .shape [1 ])+(fx /frame .shape [1 ])
-                                        lm .y =lm .y *(fh /frame .shape [0 ])+(fy /frame .shape [0 ])
-                                    face_landmarks =f_lm .landmark 
-
-                                    mp_drawing .draw_landmarks (
-                                    annotated ,f_lm ,mp_face .FACEMESH_TESSELATION ,
-                                    landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
-                                    connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =1 ))
-                                    break 
-                                break 
 
 
                     cv2 .rectangle (annotated ,(x1 ,y1 ),(x2 ,y2 ),(0 ,255 ,0 ),2 )
                     cv2 .putText (annotated ,f"ID:{tid }",(x1 ,y1 +20 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.6 ,(255 ,255 ,255 ),2 )
-
-                    if has_pose and pts is not None and pts .shape [0 ]>=17 :
-                        landmark_histories [tid ].append (pts )
 
 
         if active_tracks_in_box :
@@ -497,7 +375,6 @@ while True :
                 client_start_time =now 
                 client_scores =[]
                 last_score_time =now 
-                agg_history =[]
                 print (f"[{time .strftime ('%H:%M:%S')}] New client ID {front_tid } entered.")
 
 
@@ -531,12 +408,6 @@ while True :
                     agg_sc =sum (scores )/len (scores )if scores else 0 
 
                     client_scores .append ((body_sc ,face_sc ,agg_sc ))
-                    agg_history .append (agg_sc )
-
-
-                    current_face_sc =face_sc 
-                    current_body_sc =body_sc 
-                    current_agg_sc =agg_sc 
 
             else :
 
@@ -564,7 +435,6 @@ while True :
                 client_start_time =now 
                 client_scores =[]
                 last_score_time =now 
-                agg_history =[]
                 print (f"[{time .strftime ('%H:%M:%S')}] New client ID {front_tid } entered.")
 
         else :
@@ -595,38 +465,8 @@ while True :
         if client_box :
             cv2 .rectangle (annotated ,(client_box [0 ],client_box [1 ]),(client_box [2 ],client_box [3 ]),(255 ,0 ,0 ),2 )
 
-
-    cv2 .putText (annotated ,f"face : {current_face_sc }",(10 ,30 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,255 ,0 ),2 )
-    cv2 .putText (annotated ,f"posture : {current_body_sc }",(10 ,60 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,255 ,0 ),2 )
-    cv2 .putText (annotated ,f"total : {current_agg_sc }",(10 ,90 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,255 ,0 ),2 )
-
-
-    if monitoring_mode and len (agg_history )>0 :
-        annotated =draw_satisfaction_graph (annotated ,agg_history ,annotated .shape [1 ])
-
     cv2 .imshow ("YOLO + Pose + Face (Satisfaction)",annotated )
     if cv2 .waitKey (1 )==27 :break 
-
-
-if current_client_tid is not None :
-    total_time =now -client_start_time 
-    if client_scores :
-        posture_scores =[s [0 ]for s in client_scores ]
-        face_scores =[s [1 ]for s in client_scores ]
-        agg_scores =[s [2 ]for s in client_scores ]
-        mean_posture =np .mean (posture_scores )
-        mean_face =np .mean (face_scores )
-        mean_total =np .mean (agg_scores )
-    else :
-        mean_posture =mean_face =mean_total =0 
-
-    print (f"[{time .strftime ('%H:%M:%S')}] Client ID {current_client_tid } left (video end).")
-    print (f"Time spent: {total_time :.1f}s")
-    print (f"Scores list: {client_scores }")
-    print (f"Mean posture: {mean_posture :.1f}")
-    print (f"Mean face: {mean_face :.1f}")
-    print (f"Total mean score: {mean_total :.1f}")
-    client_logs .append ((current_client_tid ,total_time ,mean_posture ,mean_face ,mean_total ))
 
 
 print ("All client logs:")

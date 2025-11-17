@@ -5,10 +5,12 @@ import numpy as np
 import cv2 
 from ultralytics import YOLO 
 import mediapipe as mp 
-
+import os 
+import urllib .request 
+from tqdm import tqdm 
 
 model =YOLO ("yolov8x-pose.pt")
-cap =cv2 .VideoCapture ("./testcases/siu.mp4")
+cap =cv2 .VideoCapture ("./testcases/preview.mp4")
 
 mp_face =mp .solutions .face_mesh 
 face_mesh =mp_face .FaceMesh (
@@ -21,24 +23,34 @@ min_tracking_confidence =0.3
 
 mp_drawing =mp .solutions .drawing_utils 
 
+TINY_FACE_URL ="https://github.com/lindevs/yolov8-face/releases/download/v1.0.0/yolov8n-face-lindevs.pt"
+TINY_FACE_PATH ="yolov8n-face-lindevs.pt"
 
-face_cascade =cv2 .CascadeClassifier (cv2 .data .haarcascades +'haarcascade_frontalface_default.xml')
+if not os .path .exists (TINY_FACE_PATH ):
+    print ("Downloading tiny face model …")
+    def _download (url ,dst ):
+        with tqdm (unit ='B',unit_scale =True ,desc =os .path .basename (dst ))as t :
+            def _reporthook (b ,bs ,ts ):
+                if ts !=-1 :t .total =ts 
+                t .update (bs )
+            urllib .request .urlretrieve (url ,dst ,reporthook =_reporthook )
+    _download (TINY_FACE_URL ,TINY_FACE_PATH )
+    print ("Done!")
 
-HISTORY_LEN =20 
-TORSO_ACTIVITY_THRESHOLD =0.0025 
-ARM_ACTIVITY_THRESHOLD =0.005 
-MIN_SHOULDER_WIDTH_FRAC =0.10 
-STATIONARY_SECONDS =4.0 
+face_model =YOLO (TINY_FACE_PATH )
 
+HISTORY_LEN               = 20  # Increased for more robustness
+TORSO_ACTIVITY_THRESHOLD  = 0.0025   # the movement allowed
+ARM_ACTIVITY_THRESHOLD    = 0.005
+MIN_SHOULDER_WIDTH_FRAC   = 0.10     # smaller people are OK
+STATIONARY_SECONDS        = 4.0      # Adjusted as per user
 
-CLIENT_BOX_SCALE_W =3 
-CLIENT_BOX_SCALE_H =1.5 
-OVERLAP_THRESH =0.5 
-SCORE_INTERVAL =1.0 
-CENTROID_DISP_THRESH =0.05 
-
-EYE_CONF_THRESHOLD =0.5 
-
+CLIENT_BOX_SCALE_W = 2.5  # Width scale
+CLIENT_BOX_SCALE_H = 1  # Height scale
+SCORE_INTERVAL   = 1.0  # Compute scores every 1 second
+CENTROID_DISP_THRESH = 0.05  # Relaxed to 0.05 (5% of frame) for "close to same place"
+LEAVING_THRESHOLD = 0.2  # Overlap below this considers client left
+ENTERING_THRESHOLD = 0.90  # Overlap at or above this to count as new client
 
 COCO_CONNECTIONS =[
 (0 ,1 ),(0 ,2 ),(1 ,3 ),(2 ,4 ),(0 ,5 ),(0 ,6 ),(5 ,7 ),(7 ,9 ),(6 ,8 ),(8 ,10 ),
@@ -135,7 +147,7 @@ def compute_satisfaction_score (history ,fw ,fh ,prev_score =None ,alpha =0.6 ):
 
 def compute_face_expression_score (face_landmarks ,fw ,fh ,prev_score =None ,alpha =0.6 ):
     if face_landmarks is None :return None ,0 ,{}
-    pts =np .array ([[p .x ,p .y ]for p in face_landmarks ],dtype =np .float32 )
+    pts =np .array ([[p .x ,p .y ]for p in face_landmarks .landmark ],dtype =np .float32 )
     try :
         lm_l_mouth =pts [61 ];lm_r_mouth =pts [291 ]
         lm_top_lip =pts [13 ];lm_bottom_lip =pts [14 ]
@@ -250,6 +262,73 @@ def compute_centroid_disp (bbox_list ,fw ,fh ):
     return np .mean (disps )
 
 
+
+
+last_face_check =0.0 
+cached_face_box =None 
+cached_face_landmarks =None 
+
+def get_face_for_person (person_bbox ,now ):
+    """Return (face_box, face_landmarks) for the given person bbox.
+       Detects only every 0.5 s, otherwise re-uses the cached result."""
+    global last_face_check ,cached_face_box ,cached_face_landmarks 
+
+
+    if now -last_face_check <0.5 :
+
+        if cached_face_box and box_overlap (person_bbox ,cached_face_box )>0.4 :
+            return cached_face_box ,cached_face_landmarks 
+
+
+
+    x1 ,y1 ,x2 ,y2 =person_bbox 
+    crop =frame [y1 :y2 ,x1 :x2 ]
+    if crop .size ==0 :
+        return None ,None 
+
+    results =face_model (crop ,verbose =False ,conf =0.25 )
+    if results [0 ].boxes is None or len (results [0 ].boxes )==0 :
+
+        cached_face_box =None 
+        cached_face_landmarks =None 
+        return None ,None 
+
+
+    best =results [0 ].boxes [0 ]
+    fx1 ,fy1 ,fx2 ,fy2 =map (int ,best .xyxy [0 ].tolist ())
+
+    fx1 +=x1 ;fy1 +=y1 ;fx2 +=x1 ;fy2 +=y1 
+    face_box =(fx1 ,fy1 ,fx2 ,fy2 )
+
+
+    crop_face_y1 =max (0 ,fy1 -y1 )
+    crop_face_y2 =min (crop .shape [0 ],fy2 -y1 )
+    crop_face_x1 =max (0 ,fx1 -x1 )
+    crop_face_x2 =min (crop .shape [1 ],fx2 -x1 )
+    face_crop =crop [crop_face_y1 :crop_face_y2 ,crop_face_x1 :crop_face_x2 ]
+    if face_crop .size ==0 :
+        landmarks =None 
+    else :
+        rgb_crop =cv2 .cvtColor (face_crop ,cv2 .COLOR_BGR2RGB )
+        mp_res =face_mesh .process (rgb_crop )
+        landmarks =None 
+        if mp_res .multi_face_landmarks :
+            lm =mp_res .multi_face_landmarks [0 ]
+
+            fw_face =crop_face_x2 -crop_face_x1 
+            fh_face =crop_face_y2 -crop_face_y1 
+            for p in lm .landmark :
+                p .x =(p .x *fw_face +(fx1 ))/fw 
+                p .y =(p .y *fh_face +(fy1 ))/fh 
+            landmarks =lm 
+
+
+    cached_face_box =face_box 
+    cached_face_landmarks =landmarks 
+    last_face_check =now 
+    return face_box ,landmarks 
+
+
 def draw_satisfaction_graph (frame ,agg_history ,fw ,graph_height =200 ):
     if len (agg_history )==0 :
         return frame 
@@ -303,9 +382,6 @@ while True :
     if not ret :break 
 
     fh ,fw =frame .shape [:2 ]
-    rgb =cv2 .cvtColor (frame ,cv2 .COLOR_BGR2RGB )
-
-    face_res =face_mesh .process (rgb )
 
     results =model .track (frame ,persist =True ,classes =[0 ],verbose =False )
     annotated =frame .copy ()
@@ -355,27 +431,16 @@ while True :
         if current_candidates :
             best_tid =max (current_candidates ,key =lambda tid :current_candidates [tid ][0 ])
             _ ,best_centroid ,_ =current_candidates [best_tid ]
-
-
-            facing_camera =False 
-            if results [0 ].keypoints is not None :
-                for i in range (len (results [0 ].boxes )):
-                    if results [0 ].boxes [i ].id is not None and int (results [0 ].boxes [i ].id .item ())==best_tid :
-                        keypoints =results [0 ].keypoints .data [i ].cpu ().numpy ()
-                        confidences =keypoints [:,2 ]
-                        left_eye_conf =confidences [1 ]
-                        right_eye_conf =confidences [2 ]
-                        if left_eye_conf >EYE_CONF_THRESHOLD and right_eye_conf >EYE_CONF_THRESHOLD :
-                            facing_camera =True 
-                        break 
-
-            if facing_camera :
+            best_bbox =bbox_histories [best_tid ][-1 ]
+            face_box ,_ =get_face_for_person (best_bbox ,now )
+            if face_box is not None :
                 transaction_locations .append (best_centroid )
             else :
-                print (f"[{time .strftime ('%H:%M:%S')}] Ignored candidate ID {best_tid }: not facing camera (eyes not detected).")
+                print (f"[{time .strftime ('%H:%M:%S')}] Ignored candidate ID {best_tid }: no face detected.")
 
 
         if len (transaction_locations )>10 :
+            guichet_start_time =stationary_start_time [best_tid ]
             from sklearn .cluster import DBSCAN 
             locs =np .array (transaction_locations )
             cl =DBSCAN (eps =50 ,min_samples =3 ).fit (locs )
@@ -385,7 +450,7 @@ while True :
                 guichet_loc =np .mean (locs [lbls ==main ],axis =0 ).astype (int )
 
 
-                avg_w =np .mean ([bbox_area (b )for hist in bbox_histories .values ()for b in hist if hist ])**0.5 
+                avg_w =np .mean ([bbox_area (b )for hist in bbox_histories .values ()for b in hist ])**0.5 
                 avg_h =avg_w *1.5 
                 cx ,cy =guichet_loc 
                 client_box =(int (cx -avg_w /2 *CLIENT_BOX_SCALE_W ),
@@ -405,143 +470,23 @@ while True :
             x1 ,y1 ,x2 ,y2 =map (int ,box .xyxy [0 ].tolist ())
 
             overlap =box_overlap ((x1 ,y1 ,x2 ,y2 ),client_box )
-            if overlap >OVERLAP_THRESH :
+            if overlap >=LEAVING_THRESHOLD :
                 active_tracks_in_box .append ((tid ,overlap ,(x1 ,y1 ,x2 ,y2 )))
 
-
-                if tid ==current_client_tid :
-                    if tid not in landmark_histories :
-                        landmark_histories [tid ]=collections .deque (maxlen =HISTORY_LEN )
-                        torso_activity_histories [tid ]=collections .deque (maxlen =5 )
-                        prev_body_scores [tid ]=None 
-                        prev_face_scores [tid ]=None 
-
-                    has_pose =False 
-                    face_landmarks =None 
-
-
-                    pts =None 
-                    if results [0 ].keypoints is not None and len (results [0 ].keypoints )>0 :
-                        for i ,kp in enumerate (results [0 ].keypoints ):
-                            if results [0 ].boxes [i ].id is not None and int (results [0 ].boxes [i ].id .item ())==tid :
-                                keypoints =kp .data .cpu ().numpy ()
-                                pts =keypoints [0 ,:,:2 ]
-                                confidences =keypoints [0 ,:,2 ]
-
-                                low_conf_mask =confidences <0.5 
-                                pts [low_conf_mask ]=[0 ,0 ]
-
-                                pts [:,0 ]/=fw 
-                                pts [:,1 ]/=fh 
-                                has_pose =True 
-
-                                for idx1 ,idx2 in COCO_CONNECTIONS :
-                                    if np .all (pts [idx1 ]!=0 )and np .all (pts [idx2 ]!=0 ):
-                                        pt1 =(int (pts [idx1 ][0 ]*fw ),int (pts [idx1 ][1 ]*fh ))
-                                        pt2 =(int (pts [idx2 ][0 ]*fw ),int (pts [idx2 ][1 ]*fh ))
-                                        cv2 .line (annotated ,pt1 ,pt2 ,(255 ,0 ,0 ),2 )
-                                break 
-
-
-                    if face_res .multi_face_landmarks :
-                        for f_lm in face_res .multi_face_landmarks :
-                            xs =np .array ([p .x for p in f_lm .landmark ])*fw 
-                            ys =np .array ([p .y for p in f_lm .landmark ])*fh 
-                            fx1 ,fy1 ,fx2 ,fy2 =int (xs .min ()),int (ys .min ()),int (xs .max ()),int (ys .max ())
-                            if max (x1 ,fx1 )<min (x2 ,fx2 )and max (y1 ,fy1 )<min (y2 ,fy2 ):
-                                face_landmarks =f_lm .landmark 
-
-                                mp_drawing .draw_landmarks (
-                                annotated ,f_lm ,mp_face .FACEMESH_TESSELATION ,
-                                landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
-                                connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =1 ))
-                                break 
-                    if face_landmarks is None :
-                        gray =cv2 .cvtColor (frame ,cv2 .COLOR_BGR2GRAY )
-                        haar_faces =face_cascade .detectMultiScale (gray ,scaleFactor =1.1 ,minNeighbors =5 ,minSize =(30 ,30 ))
-                        for (fx ,fy ,fw ,fh )in haar_faces :
-                            if max (x1 ,fx )<min (x2 ,fx +fw )and max (y1 ,fy )<min (y2 ,fy +fh ):
-
-                                face_crop =frame [fy :fy +fh ,fx :fx +fw ]
-                                rgb_crop =cv2 .cvtColor (face_crop ,cv2 .COLOR_BGR2RGB )
-                                crop_res =face_mesh .process (rgb_crop )
-                                if crop_res .multi_face_landmarks :
-                                    f_lm =crop_res .multi_face_landmarks [0 ]
-
-                                    for lm in f_lm .landmark :
-                                        lm .x =lm .x *(fw /frame .shape [1 ])+(fx /frame .shape [1 ])
-                                        lm .y =lm .y *(fh /frame .shape [0 ])+(fy /frame .shape [0 ])
-                                    face_landmarks =f_lm .landmark 
-
-                                    mp_drawing .draw_landmarks (
-                                    annotated ,f_lm ,mp_face .FACEMESH_TESSELATION ,
-                                    landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
-                                    connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =1 ))
-                                    break 
-                                break 
-
-
-                    cv2 .rectangle (annotated ,(x1 ,y1 ),(x2 ,y2 ),(0 ,255 ,0 ),2 )
-                    cv2 .putText (annotated ,f"ID:{tid }",(x1 ,y1 +20 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.6 ,(255 ,255 ,255 ),2 )
-
-                    if has_pose and pts is not None and pts .shape [0 ]>=17 :
-                        landmark_histories [tid ].append (pts )
-
-
+        front_tid =None 
         if active_tracks_in_box :
-            active_tracks_in_box .sort (key =lambda x :x [1 ],reverse =True )
-            front_tid =active_tracks_in_box [0 ][0 ]
-
-            if current_client_tid is None :
-                current_client_tid =front_tid 
-                client_start_time =now 
-                client_scores =[]
-                last_score_time =now 
-                agg_history =[]
-                print (f"[{time .strftime ('%H:%M:%S')}] New client ID {front_tid } entered.")
-
-
-            current_overlap =next ((ov for tid ,ov ,_ in active_tracks_in_box if tid ==current_client_tid ),0 )
+            high_overlap_candidates =[t for t in active_tracks_in_box if t [1 ]>=ENTERING_THRESHOLD ]
+            current_overlap =next ((ov for tid ,ov ,_ in active_tracks_in_box if tid ==current_client_tid ),0.0 )
             if current_overlap >0 :
                 front_tid =current_client_tid 
+            elif high_overlap_candidates :
+                high_overlap_candidates .sort (key =lambda x :x [1 ],reverse =True )
+                front_tid =high_overlap_candidates [0 ][0 ]
 
-            if current_client_tid ==front_tid :
-
-                if now -last_score_time >=SCORE_INTERVAL :
-                    last_score_time =now 
-
-
-                    body_sc =0 
-                    if current_client_tid in landmark_histories and len (landmark_histories [current_client_tid ])>=3 :
-                        _ ,body_sc ,_ =compute_satisfaction_score (
-                        landmark_histories [current_client_tid ],fw ,fh ,
-                        prev_body_scores .get (current_client_tid ))
-                        prev_body_scores [current_client_tid ]=body_sc 
-
-
-                    face_sc =0 
-                    if face_landmarks :
-                        _ ,face_sc ,_ =compute_face_expression_score (
-                        face_landmarks ,fw ,fh ,
-                        prev_face_scores .get (current_client_tid ))
-                        prev_face_scores [current_client_tid ]=face_sc 
-
-
-                    scores =[s for s in (body_sc ,face_sc )if s >0 ]
-                    agg_sc =sum (scores )/len (scores )if scores else 0 
-
-                    client_scores .append ((body_sc ,face_sc ,agg_sc ))
-                    agg_history .append (agg_sc )
-
-
-                    current_face_sc =face_sc 
-                    current_body_sc =body_sc 
-                    current_agg_sc =agg_sc 
-
-            else :
-
+        if front_tid is not None :
+            if current_client_tid is None or current_client_tid !=front_tid :
                 if current_client_tid is not None :
-                    total_time =now -client_start_time 
+                    total_time =now -guichet_start_time 
                     if client_scores :
                         posture_scores =[s [0 ]for s in client_scores ]
                         face_scores =[s [1 ]for s in client_scores ]
@@ -566,6 +511,97 @@ while True :
                 last_score_time =now 
                 agg_history =[]
                 print (f"[{time .strftime ('%H:%M:%S')}] New client ID {front_tid } entered.")
+
+
+            tid =current_client_tid 
+            if tid not in landmark_histories :
+                landmark_histories [tid ]=collections .deque (maxlen =HISTORY_LEN )
+                torso_activity_histories [tid ]=collections .deque (maxlen =5 )
+                prev_body_scores [tid ]=None 
+                prev_face_scores [tid ]=None 
+
+            person_bbox =next (b for t ,o ,b in active_tracks_in_box if t ==tid )
+            x1 ,y1 ,x2 ,y2 =person_bbox 
+
+            has_pose =False 
+            pts =None 
+            if results [0 ].keypoints is not None and len (results [0 ].keypoints )>0 :
+                for i ,kp in enumerate (results [0 ].keypoints ):
+                    if results [0 ].boxes [i ].id is not None and int (results [0 ].boxes [i ].id .item ())==tid :
+                        keypoints =kp .data .cpu ().numpy ()
+                        pts =keypoints [0 ,:,:2 ]
+                        confidences =keypoints [0 ,:,2 ]
+
+                        low_conf_mask =confidences <0.5 
+                        pts [low_conf_mask ]=[0 ,0 ]
+
+                        pts [:,0 ]/=fw 
+                        pts [:,1 ]/=fh 
+                        has_pose =True 
+
+                        for idx1 ,idx2 in COCO_CONNECTIONS :
+                            if np .all (pts [idx1 ]!=0 )and np .all (pts [idx2 ]!=0 ):
+                                pt1 =(int (pts [idx1 ][0 ]*fw ),int (pts [idx1 ][1 ]*fh ))
+                                pt2 =(int (pts [idx2 ][0 ]*fw ),int (pts [idx2 ][1 ]*fh ))
+                                cv2 .line (annotated ,pt1 ,pt2 ,(255 ,0 ,0 ),2 )
+                        break 
+
+
+            face_box ,face_landmarks =get_face_for_person (person_bbox ,now )
+
+
+            if face_box :
+                fx1 ,fy1 ,fx2 ,fy2 =face_box 
+                cv2 .rectangle (annotated ,(fx1 ,fy1 ),(fx2 ,fy2 ),(0 ,255 ,255 ),2 )
+
+
+            if face_landmarks :
+                mp_drawing .draw_landmarks (
+                annotated ,
+                face_landmarks ,
+                mp_face .FACEMESH_TESSELATION ,
+                landmark_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,100 ,0 ),thickness =0 ,circle_radius =0 ),
+                connection_drawing_spec =mp_drawing .DrawingSpec (color =(255 ,0 ,0 ),thickness =1 )
+                )
+
+
+            cv2 .rectangle (annotated ,(x1 ,y1 ),(x2 ,y2 ),(0 ,255 ,0 ),2 )
+            cv2 .putText (annotated ,f"ID:{tid }",(x1 ,y1 +20 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.6 ,(255 ,255 ,255 ),2 )
+
+            if has_pose and pts is not None and pts .shape [0 ]>=17 :
+                landmark_histories [tid ].append (pts )
+
+
+            if now -last_score_time >=SCORE_INTERVAL :
+                last_score_time =now 
+
+
+                body_sc =0 
+                if tid in landmark_histories and len (landmark_histories [tid ])>=3 :
+                    _ ,body_sc ,_ =compute_satisfaction_score (
+                    landmark_histories [tid ],fw ,fh ,
+                    prev_body_scores .get (tid ))
+                    prev_body_scores [tid ]=body_sc 
+
+
+                face_sc =0 
+                if face_landmarks :
+                    _ ,face_sc ,_ =compute_face_expression_score (
+                    face_landmarks ,fw ,fh ,
+                    prev_face_scores .get (tid ))
+                    prev_face_scores [tid ]=face_sc 
+
+
+                scores =[s for s in (body_sc ,face_sc )if s >0 ]
+                agg_sc =sum (scores )/len (scores )if scores else 0 
+
+                client_scores .append ((body_sc ,face_sc ,agg_sc ))
+                agg_history .append (agg_sc )
+
+
+                current_face_sc =face_sc 
+                current_body_sc =body_sc 
+                current_agg_sc =agg_sc 
 
         else :
 
@@ -600,6 +636,23 @@ while True :
     cv2 .putText (annotated ,f"posture : {current_body_sc }",(10 ,60 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,255 ,0 ),2 )
     cv2 .putText (annotated ,f"total : {current_agg_sc }",(10 ,90 ),cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,(0 ,255 ,0 ),2 )
 
+
+    if current_client_tid is not None :
+        elapsed =now -client_start_time 
+        chron_text =f"Client Time: {elapsed :.1f}s"
+        text_size =cv2 .getTextSize (chron_text ,cv2 .FONT_HERSHEY_SIMPLEX ,0.8 ,2 )[0 ]
+        chron_x =fw -text_size [0 ]-15 
+        chron_y =35 
+        cv2 .putText (
+        annotated ,
+        chron_text ,
+        (chron_x ,chron_y ),
+        cv2 .FONT_HERSHEY_SIMPLEX ,
+        0.8 ,
+        (0 ,255 ,0 ),
+        2 ,
+        cv2 .LINE_AA ,
+        )
 
     if monitoring_mode and len (agg_history )>0 :
         annotated =draw_satisfaction_graph (annotated ,agg_history ,annotated .shape [1 ])
