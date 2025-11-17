@@ -16,7 +16,7 @@ import threading
 dotenv.load_dotenv()
 
 model = YOLO("yolov8x-pose.pt")
-cap   = cv2.VideoCapture("./testcases/siu.mp4")
+cap   = cv2.VideoCapture("./testcases/cam3.mp4")
 # siu.mp4
 # preview.mp4
 # swey.mp4

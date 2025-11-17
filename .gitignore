@@ -3,3 +3,4 @@ __pycache__/
 yolo*.pt
 *.mp4
 .env
+*.pt
