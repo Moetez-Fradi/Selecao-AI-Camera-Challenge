@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Satisfaction Monitor (Web)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:18px}
+    .controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    #video-box{position:relative;display:inline-block;border:1px solid #ddd}
+    #videoStream{display:block;max-width:960px;width:100%;}
+    #overlay{position:absolute;left:0;top:0;pointer-events:auto}
+    .metric{font-weight:600}
+    #graph{width:100%;max-width:960px;height:260px}
+    .small{font-size:0.9rem;color:#444}
+  </style>
+</head>
+<body>
+  <h2>Satisfaction Monitor</h2>
+
+  <div class="controls">
+    <form id="startForm">
+      <label>Script:
+        <select name="script" id="script">
+          <option value="script1">Script 1 (pose + mediapipe face)</option>
+          <option value="script2">Script 2 (pose + emotion model)</option>
+        </select>
+      </label>
+
+      <label>Source type:
+        <select id="sourceType" name="sourceType">
+          <option value="camera">Camera index</option>
+          <option value="upload">Upload file</option>
+        </select>
+      </label>
+
+      <input type="number" name="source" id="camIndex" value="0" min="0" style="width:80px" />
+      <input type="file" name="videoFile" id="videoFile" accept="video/*" style="display:none"/>
+
+      <label style="margin-left:8px">
+        <input type="checkbox" name="auto_detect" id="autoDetect"> Auto-detect client zone
+      </label>
+
+      <button type="submit">Start</button>
+      <button type="button" id="stopBtn">Stop</button>
+      <button type="button" id="clearBoxBtn">Clear Box</button>
+    </form>
+  </div>
+
+  <div style="margin-top:12px">
+    <div id="video-box">
+      <img id="videoStream" src="/video_feed" crossorigin="anonymous" />
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <div style="display:inline-block;vertical-align:top;margin-left:18px;min-width:220px">
+      <div>Face: <span id="faceVal" class="metric">0</span></div>
+      <div>Posture: <span id="postureVal" class="metric">0</span></div>
+      <div>Total: <span id="totalVal" class="metric">0</span></div>
+      <div id="insight" class="small" style="margin-top:12px;color:#222"></div>
+    </div>
+  </div>
+
+  <canvas id="graph"></canvas>
+
+<script>
+  // UI wiring
+  const sourceType = document.getElementById('sourceType');
+  const videoFile = document.getElementById('videoFile');
+  const camIndex = document.getElementById('camIndex');
+  const overlay = document.getElementById('overlay');
+  const videoStream = document.getElementById('videoStream');
+
+  // toggle file / camera input
+  sourceType.addEventListener('change', ()=>{
+    if(sourceType.value === 'upload'){
+      camIndex.style.display = 'none';
+      videoFile.style.display = 'inline-block';
+    } else {
+      camIndex.style.display = 'inline-block';
+      videoFile.style.display = 'none';
+    }
+  });
+
+  // start/stop
+  const startForm = document.getElementById('startForm');
+  startForm.addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const form = new FormData(startForm);
+    let source = null;
+    if(sourceType.value === 'upload'){
+      if(videoFile.files.length === 0){ alert('Choose a video file'); return; }
+      // file will be sent as form file
+      source = 'upload';
+    } else {
+      source = (camIndex.value || '0').toString();
+      form.set('source', source);
+    }
+    // send file + other fields to /start
+    if(source === 'upload'){
+      // append the file
+      form.set('source', 'upload');
+      form.set('videoFile', videoFile.files[0], videoFile.files[0].name);
+    } else {
+      form.set('source', source);
+    }
+    // ensure auto_detect flag present if checked
+    const resp = await fetch('/start', { method: 'POST', body: form });
+    const j = await resp.json();
+    if(!j.ok){ alert('Failed to start: ' + (j.error || 'unknown')); }
+  });
+
+  document.getElementById('stopBtn').addEventListener('click', async ()=>{
+    await fetch('/stop', { method: 'POST' });
+  });
+
+  document.getElementById('clearBoxBtn').addEventListener('click', async ()=>{
+    await fetch('/clear_box', { method: 'POST' });
+    clearOverlay();
+  });
+
+  // overlay drawing for manual client box
+  let drawing = false, startX = 0, startY = 0, curRect = null;
+
+  function resizeOverlay(){
+    // sync canvas size to image size
+    overlay.width = videoStream.clientWidth;
+    overlay.height = videoStream.clientHeight;
+    overlay.style.left = videoStream.offsetLeft + 'px';
+    overlay.style.top = videoStream.offsetTop + 'px';
+  }
+  // attempt to adjust when stream image changes size
+  setInterval(()=>{ if(videoStream.naturalWidth){ resizeOverlay(); }}, 200);
+
+  function clearOverlay(){
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    curRect = null;
+  }
+
+  overlay.addEventListener('mousedown', (ev)=>{
+    drawing = true;
+    const r = overlay.getBoundingClientRect();
+    startX = ev.clientX - r.left;
+    startY = ev.clientY - r.top;
+  });
+  overlay.addEventListener('mousemove', (ev)=>{
+    if(!drawing) return;
+    const r = overlay.getBoundingClientRect();
+    const x = ev.clientX - r.left;
+    const y = ev.clientY - r.top;
+    const ctx = overlay.getContext('2d');
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    ctx.strokeStyle = 'lime';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(startX, startY, x - startX, y - startY);
+  });
+  overlay.addEventListener('mouseup', async (ev)=>{
+    if(!drawing) return;
+    drawing = false;
+    const r = overlay.getBoundingClientRect();
+    const x = ev.clientX - r.left;
+    const y = ev.clientY - r.top;
+    // normalize coordinates [0,1] relative to displayed image size
+    const x1 = Math.max(0, Math.min(startX, x)) / overlay.width;
+    const y1 = Math.max(0, Math.min(startY, y)) / overlay.height;
+    const x2 = Math.min(overlay.width, Math.max(startX, x)) / overlay.width;
+    const y2 = Math.min(overlay.height, Math.max(startY, y)) / overlay.height;
+    curRect = { x1, y1, x2, y2 };
+    // draw stable rectangle
+    const ctx = overlay.getContext('2d'); ctx.clearRect(0,0,overlay.width, overlay.height);
+    ctx.strokeStyle = 'lime'; ctx.lineWidth = 2;
+    ctx.strokeRect(x1*overlay.width, y1*overlay.height, (x2-x1)*overlay.width, (y2-y1)*overlay.height);
+
+    // send normalized box to server
+    await fetch('/set_box', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(curRect)
+    });
+  });
+
+  // metrics & graph
+  const faceVal = document.getElementById('faceVal');
+  const postureVal = document.getElementById('postureVal');
+  const totalVal = document.getElementById('totalVal');
+  const insightEl = document.getElementById('insight');
+
+  const ctx = document.getElementById('graph').getContext('2d');
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'Satisfaction', data: [], fill:false, tension:0.2 }] },
+    options: { animation:false, scales:{ y:{ min:0, max:100 } } }
+  });
+
+  async function fetchMetrics(){
+    try{
+      const r = await fetch('/metrics');
+      if(!r.ok) return;
+      const j = await r.json();
+      faceVal.textContent = j.face;
+      postureVal.textContent = j.posture;
+      totalVal.textContent = j.total;
+      insightEl.textContent = j.insight || '';
+      if(Array.isArray(j.agg_history)){
+        chart.data.labels = j.agg_history.map((_,i)=>i+1);
+        chart.data.datasets[0].data = j.agg_history;
+        chart.update();
+      }
+    }catch(e){}
+  }
+  setInterval(fetchMetrics, 1000);
+
+  // ensure overlay matches streamed image after load
+  videoStream.addEventListener('load', resizeOverlay);
+  window.addEventListener('resize', resizeOverlay);
+
+</script>
+</body>
+</html>

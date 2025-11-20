@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Select Client Zone</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+<div class="container py-5">
+    <h1 class="text-center mb-4">Draw the client zone (green rectangle)</h1>
+    <div class="position-relative d-inline-block mb-4">
+        <img id="img" src="/static/frame.jpg" class="img-fluid" onload="initCanvas()">
+        <canvas id="canvas" class="position-absolute top-0 start-0"></canvas>
+    </div>
+    <form action="/process_manual" method="post">
+        <input type="hidden" name="video" value="{{ video }}">
+        <input type="hidden" name="x1" id="x1">
+        <input type="hidden" name="y1" id="y1">
+        <input type="hidden" name="x2" id="x2">
+        <input type="hidden" name="y2" id="y2">
+        <button type="submit" class="btn btn-success btn-lg">Process Video</button>
+    </form>
+</div>
+<script>
+function initCanvas() {
+    const img = document.getElementById('img');
+    const canvas = document.getElementById('canvas');
+    canvas.width = img.clientWidth;
+    canvas.height = img.clientHeight;
+    const ctx = canvas.getContext('2d');
+    let drawing = false;
+    let startX, startY;
+    canvas.addEventListener('mousedown', e => {
+        drawing = true;
+        startX = e.offsetX;
+        startY = e.offsetY;
+    });
+    canvas.addEventListener('mousemove', e => {
+        if (drawing) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = 'lime';
+            ctx.lineWidth = 3;
+            const w = e.offsetX - startX;
+            const h = e.offsetY - startY;
+            ctx.strokeRect(startX, startY, w, h);
+        }
+    });
+    canvas.addEventListener('mouseup', e => {
+        if (drawing) {
+            drawing = false;
+            const endX = e.offsetX;
+            const endY = e.offsetY;
+            const rx1 = Math.min(startX, endX);
+            const ry1 = Math.min(startY, endY);
+            const rx2 = Math.max(startX, endX);
+            const ry2 = Math.max(startY, endY);
+            const ratioX = img.naturalWidth / img.clientWidth;
+            const ratioY = img.naturalHeight / img.clientHeight;
+            document.getElementById('x1').value = Math.round(rx1 * ratioX);
+            document.getElementById('y1').value = Math.round(ry1 * ratioY);
+            document.getElementById('x2').value = Math.round(rx2 * ratioX);
+            document.getElementById('y2').value = Math.round(ry2 * ratioY);
+        }
+    });
+}
+</script>
+</body>
+</html>
